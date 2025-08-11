@@ -28,7 +28,6 @@ st.title("v7 • Probabilità calibrate + Meteo • Dashboard automatica")
 # ---------- Paths ----------
 DATA_PATH = Path('app/public/data/league_team_metrics.json')
 CAL_PATH = Path('app/public/data/calibrators.json')
-STADIUMS_PATH = Path('app/public/data/stadiums.json')
 
 # ---------- Secrets / API key (opzionale) ----------
 API_KEY = None
@@ -75,14 +74,15 @@ def auto_update_if_stale(max_age_hours=18):
             if ok:
                 st.success("Aggiornamento completato. Se la tabella non appare, premi Rerun.")
 
-# ---------- Fixtures – 3 fonti in cascata ----------
+# ---------- Fixtures – 3 fonti in cascata + diagnostica ----------
 LEAGUE_NAMES = {"I1":"Serie A","E0":"Premier League","SP1":"La Liga","D1":"Bundesliga"}
 FD_COMP = {"E0":"PL","SP1":"PD","D1":"BL1","I1":"SA"}  # football-data codes
 
 def _safe_df():
     return pd.DataFrame(columns=["date","home","away"])
 
-def _fbref_fixtures(code, days):
+def _fbref_fixtures(code, days) -> tuple[pd.DataFrame, str]:
+    """FBref fallback (può a volte essere lento/variabile)."""
     from pipeline.data_sources.fbref_schedule import get_upcoming_fixtures as fbref_get
     try:
         df = fbref_get(code, days=int(days))
@@ -90,17 +90,18 @@ def _fbref_fixtures(code, days):
             df["date"] = df["date"].astype(str)
             df["home"] = df["home"].astype(str).str.strip()
             df["away"] = df["away"].astype(str).str.strip()
-        return df
-    except Exception:
-        return _safe_df()
+        return df, ""
+    except Exception as e:
+        return _safe_df(), f"FBref err: {type(e).__name__}"
 
-def _fpl_fixtures_premier(days: int) -> pd.DataFrame:
+def _fpl_fixtures_premier(days: int) -> tuple[pd.DataFrame, str]:
     """Premier League via FPL (pubblico, gratis)."""
     try:
         teams = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=20).json().get('teams', [])
         id2name = {t['id']: t['name'] for t in teams}
         fx = requests.get("https://fantasy.premierleague.com/api/fixtures/", timeout=30).json()
-        if not isinstance(fx, list): return _safe_df()
+        if not isinstance(fx, list): 
+            return _safe_df(), "FPL: risposta inattesa"
         today = datetime.date.today()
         horizon = today + timedelta(days=max(1,int(days)))
         rows = []
@@ -109,7 +110,7 @@ def _fpl_fixtures_premier(days: int) -> pd.DataFrame:
             if not kt: continue
             try:
                 dt_utc = datetime.datetime.fromisoformat(kt.replace('Z','+00:00'))
-                # stima locale per la sola data
+                # stima della data locale per confronto (basta la data)
                 d = (dt_utc + (datetime.datetime.now() - datetime.datetime.utcnow())).date()
             except Exception:
                 continue
@@ -117,20 +118,25 @@ def _fpl_fixtures_premier(days: int) -> pd.DataFrame:
             h = id2name.get(f.get('team_h')); a = id2name.get(f.get('team_a'))
             if h and a:
                 rows.append({"date": str(d), "home": h.strip(), "away": a.strip()})
-        return pd.DataFrame(rows).drop_duplicates().reset_index(drop=True) if rows else _safe_df()
-    except Exception:
-        return _safe_df()
+        return (pd.DataFrame(rows).drop_duplicates().reset_index(drop=True) if rows else _safe_df(), "")
+    except requests.HTTPError as e:
+        return _safe_df(), f"FPL HTTP {e.response.status_code}"
+    except Exception as e:
+        return _safe_df(), f"FPL err: {type(e).__name__}"
 
-def _football_data_fixtures(code: str, days: int, api_key: str) -> pd.DataFrame:
+def _football_data_fixtures(code: str, days: int, api_key: str) -> tuple[pd.DataFrame, str]:
+    """Fixtures via football-data.org (gratis con chiave; copre PL/PD/BL1/SA)."""
     comp = FD_COMP.get(code.upper())
-    if not comp or not api_key: return _safe_df()
+    if not comp or not api_key: 
+        return _safe_df(), "no key/comp"
     try:
         today = datetime.date.today()
         horizon = today + timedelta(days=max(1,int(days)))
-        params = {"dateFrom": str(today), "dateTo": str(horizon), "competitions": comp}
+        params = {"dateFrom": str(today), "dateTo": str(horizon), "competitions": comp, "status": "SCHEDULED,POSTPONED"}
         headers = {"X-Auth-Token": api_key}
         r = requests.get("https://api.football-data.org/v4/matches", params=params, headers=headers, timeout=30)
-        r.raise_for_status()
+        if r.status_code != 200:
+            return _safe_df(), f"football-data HTTP {r.status_code}"
         js = r.json()
         rows = []
         for m in js.get("matches", []):
@@ -144,27 +150,44 @@ def _football_data_fixtures(code: str, days: int, api_key: str) -> pd.DataFrame:
             h = m.get("homeTeam",{}).get("name"); a = m.get("awayTeam",{}).get("name")
             if h and a:
                 rows.append({"date": str(d), "home": h.strip(), "away": a.strip()})
-        return pd.DataFrame(rows).drop_duplicates().reset_index(drop=True) if rows else _safe_df()
-    except Exception:
-        return _safe_df()
+        return (pd.DataFrame(rows).drop_duplicates().reset_index(drop=True) if rows else _safe_df(), "")
+    except Exception as e:
+        return _safe_df(), f"football-data err: {type(e).__name__}"
 
 def get_all_fixtures(days:int=30):
-    """Ritorna lista partite e diagnostica fonte usata per ogni lega."""
+    """Ritorna lista partite + diagnostica (fonte e eventuale errore)."""
     out = []
     diagnostics = []
     for code in ["I1","E0","SP1","D1"]:
         src_used = None
+        err_msg = ""
         df = _safe_df()
+
+        # 1) Premier: FPL prima
         if code == "E0":
-            df = _fpl_fixtures_premier(days)
-            if not df.empty: src_used = "FPL"
-        if (df.empty) and API_KEY:
-            df = _football_data_fixtures(code, days, API_KEY)
-            if not df.empty: src_used = "football-data"
+            df, err = _fpl_fixtures_premier(days)
+            if not df.empty:
+                src_used = "FPL"
+            else:
+                err_msg = err
+
+        # 2) Se c'è la chiave, prova football-data per TUTTE le leghe (anche E0 se FPL vuoto)
+        if df.empty and API_KEY:
+            d2, err2 = _football_data_fixtures(code, days, API_KEY)
+            if not d2.empty:
+                df = d2; src_used = "football-data"; err_msg = ""
+            else:
+                err_msg = (err_msg + " | " + err2).strip(" |")
+
+        # 3) Fallback FBref
         if df.empty:
-            df = _fbref_fixtures(code, days)
-            if not df.empty: src_used = "FBref"
-        diagnostics.append({"Lega": LEAGUE_NAMES[code], "Fonte": src_used or "—", "Partite": len(df)})
+            d3, err3 = _fbref_fixtures(code, days)
+            if not d3.empty:
+                df = d3; src_used = "FBref"; err_msg = ""
+            else:
+                err_msg = (err_msg + " | " + err3).strip(" |")
+
+        diagnostics.append({"Lega": LEAGUE_NAMES[code], "Fonte": src_used or "—", "Partite": len(df), "Errore": err_msg or "—"})
         if not df.empty:
             for _, r in df.iterrows():
                 out.append({
@@ -247,7 +270,7 @@ CAL = load_json_cached(CAL_PATH)
 
 # ---------- Sidebar ----------
 st.sidebar.header("Opzioni")
-horizon = st.sidebar.number_input("Giorni futuri", 1, 45, 30, 1)
+horizon = st.sidebar.number_input("Giorni futuri", 1, 60, 30, 1)
 kick_hour = st.sidebar.slider("Ora indicativa (meteo)", 12, 21, 18)
 use_meteo = st.sidebar.checkbox("Meteo automatico", value=True)
 if st.sidebar.button("🔄 Forza aggiornamento dati"):
@@ -279,16 +302,13 @@ else:
     with c2:
         th_away = st.number_input(f"Soglia tiri {away} (usa .5, es. 12.5)", min_value=0.0, step=0.5, value=12.5)
 
-    # Meteo (FIX: geocode_team_fallback restituisce un dict)
+    # Meteo
     rain = snow = wind = hot = cold = False
     meta = None
     if use_meteo:
-        lat = lon = None
         latlon = geocode_team_fallback(home, code, autosave=True)
-        if latlon:
-            lat = latlon.get("lat"); lon = latlon.get("lon")
-        if lat and lon:
-            wx = fetch_openmeteo_conditions(lat, lon, date_iso, hour_local=kick_hour, tz=tz) or {}
+        if latlon and latlon.get("lat") and latlon.get("lon"):
+            wx = fetch_openmeteo_conditions(latlon["lat"], latlon["lon"], date_iso, hour_local=kick_hour, tz=tz) or {}
             rain = wx.get('rain', False); snow = wx.get('snow', False)
             wind = wx.get('wind_strong', False); hot = wx.get('hot', False); cold = wx.get('cold', False)
             meta = wx.get('meta', {})
@@ -307,8 +327,7 @@ else:
         lam_a_c = adjust_for_weather(lam_a_c, 'angoli', (rain, snow, wind, hot, cold))
 
         def k_from_half(th): return (int(th) + 1) if ((th % 1) == 0.5) else int(np.floor(th)) + 1
-        def team_over_under(p_over):
-            return round(p_over*100,1), round((1.0-p_over)*100,1)
+        def team_over_under(p_over): return round(p_over*100,1), round((1.0-p_over)*100,1)
 
         # Tiri Home
         kH = k_from_half(th_home)
