@@ -1,0 +1,66 @@
+import json, numpy as np, pandas as pd
+from pathlib import Path
+from pipeline.data_sources.football_data import load_league_data
+from pipeline.compute_params import compute_team_metrics
+from pipeline.modeling.prob_model import combine_strengths, blended_var_factor, finalize_probability
+from pipeline.modeling.calibration import bin_and_fit
+def run_build(settings_path='settings.yaml', out_path='app/public/data/calibrators.json'):
+    import yaml
+    with open(settings_path,'r') as f: cfg=yaml.safe_load(f)
+    leagues=[l['code'] for l in cfg['leagues']]
+    shots_grid=cfg['calibration_thresholds']['shots']; corners_grid=cfg['calibration_thresholds']['corners']
+    split_ratio=float(cfg.get('split_ratio',0.7))
+    all_cals={}
+    for code in leagues:
+        df=load_league_data(code, cfg['seasons_back'])
+        if df.empty: continue
+        df['Date']=pd.to_datetime(df['Date'], errors='coerce'); df=df.dropna(subset=['Date']).sort_values('Date')
+        n=len(df); cut=int(n*split_ratio); train=df.iloc[:cut].copy(); test=df.iloc[cut:].copy()
+        metrics=compute_team_metrics(train, cfg['decay_half_life_games'])[code]
+        league_means=metrics['league_means']; league_vr=metrics['league_var_ratio']; teams=metrics['teams']
+        recs=[]
+        def pred(home, away, yH, yA, what):
+            if home not in teams or away not in teams: return
+            th,ta=teams[home],teams[away]
+            if what=='shots':
+                lmean=(league_means['shots_home_for']+league_means['shots_away_for'])/2.0
+                lamH=combine_strengths(th['shots_for_home'],league_means['shots_home_for'],ta['shots_against_away'],league_means['shots_away_against'],lmean,1.05)
+                lamA=combine_strengths(ta['shots_for_away'],league_means['shots_away_for'],th['shots_against_home'],league_means['shots_home_against'],lmean,0.95)
+                vrH=blended_var_factor(th.get('vr_shots_for_home'),ta.get('vr_shots_against_away'),league_vr.get('shots_home_for',1.1),1.0,2.0)
+                vrA=blended_var_factor(ta.get('vr_shots_for_away'),th.get('vr_shots_against_home'),league_vr.get('shots_away_for',1.1),1.0,2.0)
+                grid=shots_grid; obsH,obsA=yH,yA
+            else:
+                lmean=(league_means['corners_home_for']+league_means['corners_away_for'])/2.0
+                lamH=combine_strengths(th['corners_for_home'],league_means['corners_home_for'],ta['corners_against_away'],league_means['corners_away_against'],lmean,1.03)
+                lamA=combine_strengths(ta['corners_for_away'],league_means['corners_away_for'],th['corners_against_home'],league_means['corners_home_against'],lmean,0.97)
+                vrH=blended_var_factor(th.get('vr_corners_for_home'),ta.get('vr_corners_against_away'),league_vr.get('corners_home_for',1.3),1.1,2.5)
+                vrA=blended_var_factor(ta.get('vr_corners_for_away'),th.get('vr_corners_against_home'),league_vr.get('corners_away_for',1.3),1.1,2.5)
+                grid=corners_grid; obsH,obsA=yH,yA
+            for k in grid:
+                pH=finalize_probability(int(k), lamH, var_factor=vrH, prefer_nb=True)
+                pA=finalize_probability(int(k), lamA, var_factor=vrA, prefer_nb=True)
+                recs.append((what,'home',k,pH,1.0 if obsH>=k else 0.0))
+                recs.append((what,'away',k,pA,1.0 if obsA>=k else 0.0))
+        for _,row in test.iterrows():
+            try:
+                pred(row['HomeTeam'],row['AwayTeam'],int(row['HS']),int(row['AS']),'shots')
+                pred(row['HomeTeam'],row['AwayTeam'],int(row['HC']),int(row['AC']),'corners')
+            except Exception:
+                continue
+        if not recs: continue
+        dfR=pd.DataFrame(recs, columns=['metric','side','k','p','y'])
+        cal_map={}
+        for metric in dfR['metric'].unique():
+            cal_map.setdefault(metric,{})
+            for side in dfR['side'].unique():
+                cal_map[metric].setdefault(side,{})
+                dms=dfR[(dfR['metric']==metric) & (dfR['side']==side)]
+                for k in sorted(dms['k'].unique()):
+                    d=dms[dms['k']==k]
+                    xs,ys=bin_and_fit(d['p'].values, d['y'].values, bins=20)
+                    cal_map[metric][side][str(k)]={'x':xs.tolist(),'y':ys.tolist()}
+        all_cals[code]=cal_map
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path,'w',encoding='utf-8') as f: json.dump(all_cals,f,indent=2)
+    print("[OK] calibrators built")
+if __name__=='__main__': run_build()

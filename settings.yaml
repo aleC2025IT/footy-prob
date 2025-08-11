@@ -1,0 +1,20 @@
+leagues:
+  - code: I1
+    name: Serie A
+  - code: E0
+    name: Premier League
+  - code: D1
+    name: Bundesliga
+  - code: SP1
+    name: La Liga
+seasons_back: 2
+decay_half_life_games: 12
+default_thresholds:
+  shots: [12,15,18]
+  corners: [8,10,12]
+cup_window_days: 3
+calibration_thresholds:
+  shots: [8,10,12,15,18,20,22]
+  corners: [6,8,10,12,14]
+split_ratio: 0.7
+staleness_hours: 18

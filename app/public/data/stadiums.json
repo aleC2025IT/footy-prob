@@ -1,0 +1,50 @@
+{
+  "I1": {
+    "Fiorentina": {
+      "lat": 43.78,
+      "lon": 11.282
+    },
+    "Milan": {
+      "lat": 45.478,
+      "lon": 9.124
+    },
+    "Inter": {
+      "lat": 45.478,
+      "lon": 9.124
+    },
+    "Juventus": {
+      "lat": 45.109,
+      "lon": 7.641
+    }
+  },
+  "E0": {
+    "Arsenal": {
+      "lat": 51.555,
+      "lon": -0.108
+    },
+    "Chelsea": {
+      "lat": 51.481,
+      "lon": -0.191
+    }
+  },
+  "SP1": {
+    "Barcelona": {
+      "lat": 41.381,
+      "lon": 2.122
+    },
+    "Real Madrid": {
+      "lat": 40.453,
+      "lon": -3.688
+    }
+  },
+  "D1": {
+    "Bayern Munich": {
+      "lat": 48.218,
+      "lon": 11.624
+    },
+    "Borussia Dortmund": {
+      "lat": 51.492,
+      "lon": 7.451
+    }
+  }
+}
