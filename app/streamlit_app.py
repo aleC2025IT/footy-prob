@@ -16,7 +16,7 @@ import requests
 import streamlit as st
 import yaml
 
-# local modeling
+# local modeling / utils
 from pipeline.modeling.prob_model import combine_strengths, finalize_probability, blended_var_factor
 from pipeline.utils.auto_weather import fetch_openmeteo_conditions, LEAGUE_TZ
 from pipeline.utils.geocode import geocode_team_fallback
@@ -75,7 +75,7 @@ def auto_update_if_stale(max_age_hours=18):
             if ok:
                 st.success("Aggiornamento completato. Se la tabella non appare, premi Rerun.")
 
-# ---------- Fixtures – 3 fonti in cascata (sempre aggiornato) ----------
+# ---------- Fixtures – 3 fonti in cascata ----------
 LEAGUE_NAMES = {"I1":"Serie A","E0":"Premier League","SP1":"La Liga","D1":"Bundesliga"}
 FD_COMP = {"E0":"PL","SP1":"PD","D1":"BL1","I1":"SA"}  # football-data codes
 
@@ -83,11 +83,9 @@ def _safe_df():
     return pd.DataFrame(columns=["date","home","away"])
 
 def _fbref_fixtures(code, days):
-    # import locale solo qui per evitare dipendenza circolare
     from pipeline.data_sources.fbref_schedule import get_upcoming_fixtures as fbref_get
     try:
         df = fbref_get(code, days=int(days))
-        # normalizza
         if not df.empty:
             df["date"] = df["date"].astype(str)
             df["home"] = df["home"].astype(str).str.strip()
@@ -97,6 +95,7 @@ def _fbref_fixtures(code, days):
         return _safe_df()
 
 def _fpl_fixtures_premier(days: int) -> pd.DataFrame:
+    """Premier League via FPL (pubblico, gratis)."""
     try:
         teams = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=20).json().get('teams', [])
         id2name = {t['id']: t['name'] for t in teams}
@@ -109,13 +108,13 @@ def _fpl_fixtures_premier(days: int) -> pd.DataFrame:
             kt = f.get('kickoff_time')
             if not kt: continue
             try:
-                # kickoff UTC -> date locale UK
                 dt_utc = datetime.datetime.fromisoformat(kt.replace('Z','+00:00'))
-                d = (dt_utc + (datetime.datetime.now() - datetime.datetime.utcnow())).date()  # approx local date
+                # stima locale per la sola data
+                d = (dt_utc + (datetime.datetime.now() - datetime.datetime.utcnow())).date()
             except Exception:
                 continue
             if d < today or d > horizon: continue
-            h, a = id2name.get(f.get('team_h')), id2name.get(f.get('team_a'))
+            h = id2name.get(f.get('team_h')); a = id2name.get(f.get('team_a'))
             if h and a:
                 rows.append({"date": str(d), "home": h.strip(), "away": a.strip()})
         return pd.DataFrame(rows).drop_duplicates().reset_index(drop=True) if rows else _safe_df()
@@ -126,7 +125,6 @@ def _football_data_fixtures(code: str, days: int, api_key: str) -> pd.DataFrame:
     comp = FD_COMP.get(code.upper())
     if not comp or not api_key: return _safe_df()
     try:
-        tz_name = LEAGUE_TZ.get(code, "Europe/Rome")
         today = datetime.date.today()
         horizon = today + timedelta(days=max(1,int(days)))
         params = {"dateFrom": str(today), "dateTo": str(horizon), "competitions": comp}
@@ -139,21 +137,19 @@ def _football_data_fixtures(code: str, days: int, api_key: str) -> pd.DataFrame:
             utc_str = m.get("utcDate")
             if not utc_str: continue
             try:
-                dt = datetime.datetime.fromisoformat(utc_str.replace("Z","+00:00"))
-                d = dt.date()
+                d = datetime.datetime.fromisoformat(utc_str.replace("Z","+00:00")).date()
             except Exception:
                 continue
             if d < today or d > horizon: continue
-            h = m.get("homeTeam",{}).get("name")
-            a = m.get("awayTeam",{}).get("name")
+            h = m.get("homeTeam",{}).get("name"); a = m.get("awayTeam",{}).get("name")
             if h and a:
                 rows.append({"date": str(d), "home": h.strip(), "away": a.strip()})
         return pd.DataFrame(rows).drop_duplicates().reset_index(drop=True) if rows else _safe_df()
     except Exception:
         return _safe_df()
 
-def get_all_fixtures(days:int=21):
-    """Ritorna lista partite e da quale fonte sono arrivate per ogni lega."""
+def get_all_fixtures(days:int=30):
+    """Ritorna lista partite e diagnostica fonte usata per ogni lega."""
     out = []
     diagnostics = []
     for code in ["I1","E0","SP1","D1"]:
@@ -283,11 +279,14 @@ else:
     with c2:
         th_away = st.number_input(f"Soglia tiri {away} (usa .5, es. 12.5)", min_value=0.0, step=0.5, value=12.5)
 
-    # Meteo
+    # Meteo (FIX: geocode_team_fallback restituisce un dict)
     rain = snow = wind = hot = cold = False
     meta = None
     if use_meteo:
-        lat, lon, _ = geocode_team_fallback(home, code, autosave=True)
+        lat = lon = None
+        latlon = geocode_team_fallback(home, code, autosave=True)
+        if latlon:
+            lat = latlon.get("lat"); lon = latlon.get("lon")
         if lat and lon:
             wx = fetch_openmeteo_conditions(lat, lon, date_iso, hour_local=kick_hour, tz=tz) or {}
             rain = wx.get('rain', False); snow = wx.get('snow', False)
@@ -311,11 +310,13 @@ else:
         def team_over_under(p_over):
             return round(p_over*100,1), round((1.0-p_over)*100,1)
 
+        # Tiri Home
         kH = k_from_half(th_home)
         pH = finalize_probability(kH, lam_h_s, var_factor=vr_h_s, prefer_nb=True)
         pH = apply_isotonic(CAL, code, "tiri", "home", kH, pH)
         oh, uh = team_over_under(pH)
 
+        # Tiri Away
         kA = k_from_half(th_away)
         pA = finalize_probability(kA, lam_a_s, var_factor=vr_a_s, prefer_nb=True)
         pA = apply_isotonic(CAL, code, "tiri", "away", kA, pA)
@@ -353,10 +354,19 @@ else:
             only_list.append(fx); continue
         lam_h_s, lam_a_s, vr_h_s, vr_a_s = shots_params
         lam_h_c, lam_a_c, vr_h_c, vr_a_c = corners_params
-        row = {"Lega": fx['league'], "Data": date_iso, "Match": f"{home}-{away}"}
+
+        # Meteo sintetico (veloce)
+        T=P=W=None
+        if use_meteo:
+            latlon = geocode_team_fallback(home, code, autosave=False)
+            if latlon and latlon.get('lat') and latlon.get('lon'):
+                wx = fetch_openmeteo_conditions(latlon['lat'], latlon['lon'], date_iso, hour_local=18, tz=LEAGUE_TZ.get(code,"Europe/Rome")) or {}
+                meta = wx.get('meta',{})
+                T = meta.get('temp_c'); P = meta.get('precip_mm'); W = meta.get('wind_kmh')
+
         def pack(metric_name, lam_h, vr_h, lam_a, vr_a, ths):
             out = {}
-            for k in CFG['default_thresholds'][ 'shots' if metric_name=='tiri' else 'corners' ]:
+            for k in ths:
                 p_h = finalize_probability(int(k), lam_h, var_factor=vr_h, prefer_nb=True)
                 p_a = finalize_probability(int(k), lam_a, var_factor=vr_a, prefer_nb=True)
                 p_h = apply_isotonic(CAL, code, metric_name, "home", int(k), p_h)
@@ -364,9 +374,14 @@ else:
                 out[f"{metric_name}_H≥{k}"] = round(p_h*100,1)
                 out[f"{metric_name}_A≥{k}"] = round(p_a*100,1)
             return out
+
+        row = {"Lega": LEAGUE_NAMES[code], "Data": date_iso, "Match": f"{home}-{away}"}
         row.update(pack("tiri", lam_h_s, vr_h_s, lam_a_s, vr_a_s, CFG['default_thresholds']['shots']))
         row.update(pack("angoli", lam_h_c, vr_h_c, lam_a_c, vr_a_c, CFG['default_thresholds']['corners']))
+        if T is not None:
+            row.update({"T°C": T, "Prec(mm)": P, "Vento(km/h)": W})
         rows.append(row)
+
     if rows:
         df_out = pd.DataFrame(rows)
         try:
@@ -376,6 +391,7 @@ else:
             pass
         st.dataframe(df_out, use_container_width=True)
         st.download_button("Scarica CSV unico", df_out.to_csv(index=False).encode('utf-8'), "dashboard_prob_calibrate.csv", "text/csv")
+
     if only_list:
         st.markdown("**Partite senza dati completi (mostrate comunque):**")
         st.write(pd.DataFrame(only_list)[['league','date','home','away','source']])
