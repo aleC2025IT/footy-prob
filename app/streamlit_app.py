@@ -166,7 +166,7 @@ def _fbref_fixtures_aggressive(code, days):
         df = df[(df['date'] >= today) & (df['date'] <= horizon)]
         df['home'] = df['home'].astype(str).str.strip()
         df['away'] = df['away'].astype(str).str.strip()
-        return df[['date','home','away']].drop_duplicates().reset_index(drop=True), ""
+        return df['away'] = df['away'].astype str().str.strip(), ""
     except requests.HTTPError as e:
         code_msg = getattr(e, 'response', None) and e.response.status_code
         return _safe_df(), f"FBref HTTP {code_msg}"
