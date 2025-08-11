@@ -103,7 +103,7 @@ def _fbref_pick_current_url(code: str) -> str:
     except Exception:
         return base
 
-def _fbref_fixtures_aggressive(code, days) -> tuple[pd.DataFrame, str]:
+def _fbref_fixtures_aggressive(code, days):
     """Legge la tabella fixture FBref della STAGIONE CORRENTE, filtrando l’orizzonte."""
     try:
         url = _fbref_pick_current_url(code)
@@ -141,7 +141,7 @@ def _fbref_fixtures_aggressive(code, days) -> tuple[pd.DataFrame, str]:
     except Exception as e:
         return _safe_df(), f"FBref err: {type(e).__name__}"
 
-def _fpl_fixtures_premier(days: int) -> tuple[pd.DataFrame, str]:
+def _fpl_fixtures_premier(days):
     """Premier League via FPL (pubblico, gratis)."""
     try:
         teams = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=20).json().get('teams', [])
@@ -172,7 +172,7 @@ def _fpl_fixtures_premier(days: int) -> tuple[pd.DataFrame, str]:
     except Exception as e:
         return _safe_df(), f"FPL err: {type(e).__name__}"
 
-def _football_data_fixtures(code: str, days: int, api_key: str) -> tuple[pd.DataFrame, str]:
+def _football_data_fixtures(code, days, api_key):
     """Fixtures via football-data.org (gratis con chiave; copre PL/PD/BL1/SA)."""
     comp = FD_COMP.get(code.upper())
     if not comp or not api_key:
@@ -205,34 +205,44 @@ def _football_data_fixtures(code: str, days: int, api_key: str) -> tuple[pd.Data
     except Exception as e:
         return _safe_df(), f"football-data err: {type(e).__name__}"
 
-def get_all_fixtures(days:int=30):
+def get_all_fixtures(days=30, use_fd=True, force_fbref_sp1=False):
     """Lista partite + diagnostica (fonte/errore) per I1/E0/SP1/D1."""
     out, diags = [], []
     for code in ["I1","E0","SP1","D1"]:
         df = _safe_df()
         src = None
         err = ""
-        # 1) Premier: FPL
-        if code == "E0":
-            df, err1 = _fpl_fixtures_premier(days)
-            if not df.empty:
-                src = "FPL"
-            else:
-                err = err1
-        # 2) football-data (se hai la chiave)
-        if df.empty and API_KEY:
-            d2, err2 = _football_data_fixtures(code, days, API_KEY)
-            if not d2.empty:
-                df, src, err = d2, "football-data", ""
-            else:
-                err = (err + " | " + err2).strip(" |")
-        # 3) FBref aggressivo
-        if df.empty:
+
+        # Se forziamo FBref per La Liga, salta le altre fonti
+        if code == "SP1" and force_fbref_sp1:
             d3, err3 = _fbref_fixtures_aggressive(code, days)
             if not d3.empty:
                 df, src, err = d3, "FBref", ""
             else:
-                err = (err + " | " + err3).strip(" |")
+                err = err3 or "FBref vuoto"
+        else:
+            # 1) Premier: FPL
+            if code == "E0":
+                d1, err1 = _fpl_fixtures_premier(days)
+                if not d1.empty:
+                    df, src = d1, "FPL"
+                else:
+                    err = err1
+            # 2) football-data (se attivo)
+            if df.empty and use_fd and API_KEY:
+                d2, err2 = _football_data_fixtures(code, days, API_KEY)
+                if not d2.empty:
+                    df, src, err = d2, "football-data", ""
+                else:
+                    err = (err + " | " + err2).strip(" |")
+            # 3) FBref aggressivo
+            if df.empty:
+                d3, err3 = _fbref_fixtures_aggressive(code, days)
+                if not d3.empty:
+                    df, src, err = d3, "FBref", ""
+                else:
+                    err = (err + " | " + err3).strip(" |")
+
         diags.append({"Lega": LEAGUE_NAMES[code], "Fonte": src or "—", "Partite": len(df), "Errore": err or "—"})
         if not df.empty:
             for _, r in df.iterrows():
@@ -307,8 +317,18 @@ def adjust_for_weather(lam, metric_name, flags):
     return lam
 
 # ---------- Settings & auto-update ----------
-with open('settings.yaml','r',encoding='utf-8') as f:
-    CFG = yaml.safe_load(f)
+try:
+    with open('settings.yaml','r',encoding='utf-8') as f:
+        CFG = yaml.safe_load(f)
+except Exception:
+    # fallback sicuro
+    CFG = {
+        "staleness_hours": 18,
+        "default_thresholds": {
+            "shots":   [8,10,12,14],
+            "corners": [3,4,5,6]
+        }
+    }
 auto_update_if_stale(CFG.get('staleness_hours', 18))
 METRICS = load_json_cached(DATA_PATH)
 CAL     = load_json_cached(CAL_PATH)
@@ -318,6 +338,11 @@ st.sidebar.header("Opzioni")
 horizon   = st.sidebar.number_input("Giorni futuri", 1, 60, 30, 1)
 kick_hour = st.sidebar.slider("Ora indicativa (meteo)", 12, 21, 18)
 use_meteo = st.sidebar.checkbox("Meteo automatico", value=True)
+
+# Interruttori richiesti
+use_fd = st.sidebar.checkbox("Usa football-data.org (API)", value=bool(API_KEY))
+force_sp1 = st.sidebar.checkbox("Forza FBref per La Liga", value=True)
+
 if st.sidebar.button("🔄 Forza aggiornamento dati"):
     with st.spinner("Rigenero storico e calibratori..."):
         ok = run_full_update()
@@ -325,19 +350,9 @@ if st.sidebar.button("🔄 Forza aggiornamento dati"):
 st.sidebar.caption(f"API football-data: {'✅' if API_KEY else '❌ (opzionale)'}")
 
 # ---------- Recupera TUTTE le partite + Diagnostica ----------
-fixtures, diag_df = get_all_fixtures(days=horizon)
+fixtures, diag_df = get_all_fixtures(days=horizon, use_fd=use_fd, force_fbref_sp1=force_sp1)
 with st.expander("🔍 Diagnostica fonti partite"):
     st.write(diag_df)
-
-# ---------- Tester API football-data (debug veloce) ----------
-with st.expander("🧪 Test rapido football-data (debug)"):
-    lg = st.selectbox("Lega da testare", ["SP1","I1","D1","E0"], index=0)
-    if st.button("Prova chiamata API"):
-        df_test, err = _football_data_fixtures(lg, 30, API_KEY or "")
-        st.write("righe:", len(df_test))
-        st.write("errore:", err or "—")
-        if not df_test.empty:
-            st.dataframe(df_test.head(10))
 
 # ---------- Calcolatore personalizzato ----------
 st.subheader("🧮 Calcolatore personalizzato (tiri singola squadra + angoli totali)")
@@ -378,11 +393,8 @@ else:
         latlon = geocode_team_fallback(home, code, autosave=True)
         if latlon and latlon.get("lat") and latlon.get("lon"):
             wx = fetch_openmeteo_conditions(latlon["lat"], latlon["lon"], date_iso, hour_local=kick_hour, tz=tz) or {}
-            rain = wx.get('rain', False)
-            snow = wx.get('snow', False)
-            wind = wx.get('wind_strong', False)
-            hot = wx.get('hot', False)
-            cold = wx.get('cold', False)
+            rain = wx.get('rain', False); snow = wx.get('snow', False)
+            wind = wx.get('wind_strong', False); hot = wx.get('hot', False); cold = wx.get('cold', False)
             meta = wx.get('meta', {})
 
     # Parametri se disponibili
@@ -482,4 +494,4 @@ else:
         st.markdown("**Partite senza dati completi (mostrate comunque):**")
         st.write(pd.DataFrame(only_list)[['league','date','home','away','source']])
 
-st.caption("Fonti: FPL (PL), football-data.org (se chiave), FBref (stagione corrente, fallback). Meteo: Open-Meteo. Agg. automatico se dati >18h.")
+st.caption("Fonti: FPL (PL), football-data.org (se attivo), FBref (stagione corrente, fallback). Meteo: Open-Meteo. Agg. automatico se dati >18h.")
