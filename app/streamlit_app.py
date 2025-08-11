@@ -56,9 +56,11 @@ def run_full_update():
     r2 = subprocess.run([sys.executable, "-m", "pipeline.build_calibrators"], cwd=ROOT, capture_output=True, text=True)
     ok = True
     if r1.returncode != 0:
-        st.error("Errore metriche: " + (r1.stderr or r1.stdout)[-500:]); ok = False
+        st.error("Errore metriche: " + (r1.stderr or r1.stdout)[-500:])
+        ok = False
     if r2.returncode != 0:
-        st.error("Errore calibratori: " + (r2.stderr or r2.stdout)[-500:]); ok = False
+        st.error("Errore calibratori: " + (r2.stderr or r2.stdout)[-500:])
+        ok = False
     st.cache_data.clear()
     return ok
 
@@ -80,7 +82,8 @@ FBREF_BASE   = {
     "D1":  "https://fbref.com/en/comps/20/schedule/Bundesliga-Scores-and-Fixtures",
 }
 
-def _safe_df(): return pd.DataFrame(columns=["date","home","away"])
+def _safe_df():
+    return pd.DataFrame(columns=["date","home","away"])
 
 def _season_slug_today():
     today = datetime.date.today()
@@ -104,14 +107,17 @@ def _fbref_fixtures_aggressive(code, days) -> tuple[pd.DataFrame, str]:
     """Legge la tabella fixture FBref della STAGIONE CORRENTE, filtrando l’orizzonte."""
     try:
         url = _fbref_pick_current_url(code)
-        res = requests.get(url, timeout=30); res.raise_for_status()
+        res = requests.get(url, timeout=30)
+        res.raise_for_status()
         dfs = pd.read_html(res.text)
         target = None
         for df in dfs:
             cols = [str(c).strip().lower() for c in df.columns]
             if 'date' in cols and any('home' in c for c in cols) and any('away' in c for c in cols):
-                target = df; break
-        if target is None: return _safe_df(), "FBref: tabella non trovata"
+                target = df
+                break
+        if target is None:
+            return _safe_df(), "FBref: tabella non trovata"
         df = target.copy()
         ren = {}
         for c in df.columns:
@@ -123,88 +129,121 @@ def _fbref_fixtures_aggressive(code, days) -> tuple[pd.DataFrame, str]:
         df = df[[c for c in ['date','home','away'] if c in df.columns]].dropna(subset=['date','home','away'])
         df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.date
         df = df.dropna(subset=['date'])
-        today = datetime.date.today(); horizon = today + timedelta(days=max(1, int(days)))
+        today = datetime.date.today()
+        horizon = today + timedelta(days=max(1, int(days)))
         df = df[(df['date'] >= today) & (df['date'] <= horizon)]
         df['home'] = df['home'].astype(str).str.strip()
         df['away'] = df['away'].astype(str).str.strip()
         return df[['date','home','away']].drop_duplicates().reset_index(drop=True), ""
     except requests.HTTPError as e:
-        return _safe_df(), f"FBref HTTP {getattr(e,'response',None) and e.response.status_code}"
+        code_msg = getattr(e, 'response', None) and e.response.status_code
+        return _safe_df(), f"FBref HTTP {code_msg}"
     except Exception as e:
         return _safe_df(), f"FBref err: {type(e).__name__}"
 
 def _fpl_fixtures_premier(days: int) -> tuple[pd.DataFrame, str]:
+    """Premier League via FPL (pubblico, gratis)."""
     try:
         teams = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=20).json().get('teams', [])
         id2name = {t['id']: t['name'] for t in teams}
         fx = requests.get("https://fantasy.premierleague.com/api/fixtures/", timeout=30).json()
-        if not isinstance(fx, list): return _safe_df(), "FPL: risposta inattesa"
-        today = datetime.date.today(); horizon = today + timedelta(days=max(1,int(days)))
+        if not isinstance(fx, list):
+            return _safe_df(), "FPL: risposta inattesa"
+        today = datetime.date.today()
+        horizon = today + timedelta(days=max(1, int(days)))
         rows = []
         for f in fx:
-            kt = f.get('kickoff_time'); if not kt: continue
+            kt = f.get('kickoff_time')
+            if not kt:
+                continue
             try:
-                dt_utc = datetime.datetime.fromisoformat(kt.replace('Z','+00:00'))
-                d = (dt_utc + (datetime.datetime.now() - datetime.datetime.utcnow())).date()  # data locale approx
+                dt_utc = datetime.datetime.fromisoformat(kt.replace('Z', '+00:00'))
+                # data locale approx (per confronto basta la data)
+                d = (dt_utc + (datetime.datetime.now() - datetime.datetime.utcnow())).date()
             except Exception:
                 continue
-            if d < today or d > horizon: continue
-            h = id2name.get(f.get('team_h')); a = id2name.get(f.get('team_a'))
-            if h and a: rows.append({"date": str(d), "home": h.strip(), "away": a.strip()})
+            if d < today or d > horizon:
+                continue
+            h = id2name.get(f.get('team_h'))
+            a = id2name.get(f.get('team_a'))
+            if h and a:
+                rows.append({"date": str(d), "home": h.strip(), "away": a.strip()})
         return (pd.DataFrame(rows).drop_duplicates().reset_index(drop=True) if rows else _safe_df(), "")
     except Exception as e:
         return _safe_df(), f"FPL err: {type(e).__name__}"
 
 def _football_data_fixtures(code: str, days: int, api_key: str) -> tuple[pd.DataFrame, str]:
+    """Fixtures via football-data.org (gratis con chiave; copre PL/PD/BL1/SA)."""
     comp = FD_COMP.get(code.upper())
-    if not comp or not api_key: return _safe_df(), "no key/comp"
+    if not comp or not api_key:
+        return _safe_df(), "no key/comp"
     try:
-        today = datetime.date.today(); horizon = today + timedelta(days=max(1,int(days)))
+        today = datetime.date.today()
+        horizon = today + timedelta(days=max(1, int(days)))
         params = {"dateFrom": str(today), "dateTo": str(horizon), "competitions": comp, "status": "SCHEDULED,POSTPONED"}
         headers = {"X-Auth-Token": api_key}
         r = requests.get("https://api.football-data.org/v4/matches", params=params, headers=headers, timeout=30)
         if r.status_code != 200:
             return _safe_df(), f"football-data HTTP {r.status_code}"
-        js = r.json(); rows = []
+        js = r.json()
+        rows = []
         for m in js.get("matches", []):
-            utc = m.get("utcDate"); 
-            if not utc: continue
+            utc_str = m.get("utcDate")
+            if not utc_str:
+                continue
             try:
-                d = datetime.datetime.fromisoformat(utc.replace("Z","+00:00")).date()
+                d = datetime.datetime.fromisoformat(utc_str.replace("Z", "+00:00")).date()
             except Exception:
                 continue
-            if d < today or d > horizon: continue
-            h = m.get("homeTeam",{}).get("name"); a = m.get("awayTeam",{}).get("name")
-            if h and a: rows.append({"date": str(d), "home": h.strip(), "away": a.strip()})
+            if d < today or d > horizon:
+                continue
+            h = m.get("homeTeam", {}).get("name")
+            a = m.get("awayTeam", {}).get("name")
+            if h and a:
+                rows.append({"date": str(d), "home": h.strip(), "away": a.strip()})
         return (pd.DataFrame(rows).drop_duplicates().reset_index(drop=True) if rows else _safe_df(), "")
     except Exception as e:
         return _safe_df(), f"football-data err: {type(e).__name__}"
 
 def get_all_fixtures(days:int=30):
-    """Lista partite + diagnostica (fonte ed eventuale errore) per I1/E0/SP1/D1."""
+    """Lista partite + diagnostica (fonte/errore) per I1/E0/SP1/D1."""
     out, diags = [], []
     for code in ["I1","E0","SP1","D1"]:
-        df = _safe_df(); src = None; err = ""
-        # 1) E0: FPL
+        df = _safe_df()
+        src = None
+        err = ""
+        # 1) Premier: FPL
         if code == "E0":
             df, err1 = _fpl_fixtures_premier(days)
-            if not df.empty: src = "FPL"
-            else: err = err1
-        # 2) football-data se c'è chiave
+            if not df.empty:
+                src = "FPL"
+            else:
+                err = err1
+        # 2) football-data (se hai la chiave)
         if df.empty and API_KEY:
             d2, err2 = _football_data_fixtures(code, days, API_KEY)
-            if not d2.empty: df, src, err = d2, "football-data", ""
-            else: err = (err + " | " + err2).strip(" |")
-        # 3) FBref “aggressivo”
+            if not d2.empty:
+                df, src, err = d2, "football-data", ""
+            else:
+                err = (err + " | " + err2).strip(" |")
+        # 3) FBref aggressivo
         if df.empty:
             d3, err3 = _fbref_fixtures_aggressive(code, days)
-            if not d3.empty: df, src, err = d3, "FBref", ""
-            else: err = (err + " | " + err3).strip(" |")
+            if not d3.empty:
+                df, src, err = d3, "FBref", ""
+            else:
+                err = (err + " | " + err3).strip(" |")
         diags.append({"Lega": LEAGUE_NAMES[code], "Fonte": src or "—", "Partite": len(df), "Errore": err or "—"})
         if not df.empty:
             for _, r in df.iterrows():
-                out.append({"code": code, "league": LEAGUE_NAMES[code], "date": str(r["date"]),
-                            "home": str(r["home"]).strip(), "away": str(r["away"]).strip(), "source": src or "—"})
+                out.append({
+                    "code": code,
+                    "league": LEAGUE_NAMES[code],
+                    "date": str(r["date"]),
+                    "home": str(r["home"]).strip(),
+                    "away": str(r["away"]).strip(),
+                    "source": src or "—"
+                })
     out = sorted(out, key=lambda x: (x["date"], x["league"], x["home"]))
     return out, pd.DataFrame(diags)
 
@@ -252,7 +291,8 @@ def apply_isotonic(CAL, code, metric, side_key, k_int, p):
     if p <= xs[0]: return ys[0]
     if p >= xs[-1]: return ys[-1]
     import bisect
-    j = bisect.bisect_right(xs, p) - 1; j = max(0, min(j, len(xs)-2))
+    j = bisect.bisect_right(xs, p) - 1
+    j = max(0, min(j, len(xs)-2))
     x0,x1=xs[j], xs[j+1]; y0,y1=ys[j], ys[j+1]
     t = 0 if x1==x0 else (p-x0)/(x1-x0)
     return y0 + t*(y1-y0)
@@ -293,11 +333,11 @@ with st.expander("🔍 Diagnostica fonti partite"):
 with st.expander("🧪 Test rapido football-data (debug)"):
     lg = st.selectbox("Lega da testare", ["SP1","I1","D1","E0"], index=0)
     if st.button("Prova chiamata API"):
-        df, err = _football_data_fixtures(lg, 30, API_KEY or "")
-        st.write("righe:", len(df))
+        df_test, err = _football_data_fixtures(lg, 30, API_KEY or "")
+        st.write("righe:", len(df_test))
         st.write("errore:", err or "—")
-        if not df.empty:
-            st.dataframe(df.head(10))
+        if not df_test.empty:
+            st.dataframe(df_test.head(10))
 
 # ---------- Calcolatore personalizzato ----------
 st.subheader("🧮 Calcolatore personalizzato (tiri singola squadra + angoli totali)")
@@ -313,7 +353,8 @@ with st.expander("Incolla partite (es. 'Torino - Fiorentina'), una per riga"):
             if m:
                 fixtures.append({"code":"MAN","league":"Manuale","date":manual_date,"home":m.group(1).strip(),"away":m.group(2).strip(),"source":"Manuale"})
                 added += 1
-        if added: st.success(f"Aggiunte {added} partite manuali.")
+        if added:
+            st.success(f"Aggiunte {added} partite manuali.")
 
 if not fixtures:
     st.info("Nessuna partita trovata nell'orizzonte selezionato. Aumenta 'Giorni futuri' nella sidebar.")
@@ -331,13 +372,17 @@ else:
         th_away = st.number_input(f"Soglia tiri {away} (usa .5, es. 12.5)", min_value=0.0, step=0.5, value=12.5)
 
     # Meteo
-    rain=snow=wind=hot=cold=False; meta=None
+    rain = snow = wind = hot = cold = False
+    meta = None
     if use_meteo:
         latlon = geocode_team_fallback(home, code, autosave=True)
         if latlon and latlon.get("lat") and latlon.get("lon"):
             wx = fetch_openmeteo_conditions(latlon["lat"], latlon["lon"], date_iso, hour_local=kick_hour, tz=tz) or {}
-            rain = wx.get('rain', False); snow = wx.get('snow', False)
-            wind = wx.get('wind_strong', False); hot = wx.get('hot', False); cold = wx.get('cold', False)
+            rain = wx.get('rain', False)
+            snow = wx.get('snow', False)
+            wind = wx.get('wind_strong', False)
+            hot = wx.get('hot', False)
+            cold = wx.get('cold', False)
             meta = wx.get('meta', {})
 
     # Parametri se disponibili
@@ -355,8 +400,10 @@ else:
         lam_h_c = adjust_for_weather(lam_h_c, 'angoli', (rain, snow, wind, hot, cold))
         lam_a_c = adjust_for_weather(lam_a_c, 'angoli', (rain, snow, wind, hot, cold))
 
-        def k_from_half(th): return (int(th) + 1) if ((th % 1) == 0.5) else int(np.floor(th)) + 1
-        def team_over_under(p_over): return round(p_over*100,1), round((1.0-p_over)*100,1)
+        def k_from_half(th):
+            return (int(th) + 1) if ((th % 1) == 0.5) else int(np.floor(th)) + 1
+        def team_over_under(p_over):
+            return round(p_over*100,1), round((1.0-p_over)*100,1)
 
         kH = k_from_half(th_home)
         pH = finalize_probability(kH, lam_h_s, var_factor=vr_h_s, prefer_nb=True)
@@ -399,7 +446,9 @@ else:
         shots_params   = compute_lambda_and_var(METRICS, code, home, away, "tiri")
         corners_params = compute_lambda_and_var(METRICS, code, home, away, "angoli")
         if not shots_params or not corners_params:
-            only_list.append(fx); continue
+            only_list.append(fx)
+            continue
+
         lam_h_s, lam_a_s, vr_h_s, vr_a_s = shots_params
         lam_h_c, lam_a_c, vr_h_c, vr_a_c = corners_params
 
@@ -422,7 +471,8 @@ else:
     if rows:
         df_out = pd.DataFrame(rows)
         try:
-            df_out['Data_s'] = pd.to_datetime(df_out['Data'], errors='coerce'); df_out = df_out.sort_values(['Data_s','Lega','Match']).drop(columns=['Data_s'])
+            df_out['Data_s'] = pd.to_datetime(df_out['Data'], errors='coerce')
+            df_out = df_out.sort_values(['Data_s','Lega','Match']).drop(columns=['Data_s'])
         except Exception:
             pass
         st.dataframe(df_out, use_container_width=True)
