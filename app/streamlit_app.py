@@ -75,9 +75,8 @@ def auto_update_if_stale(max_age_hours=18):
             if ok:
                 st.success("Aggiornamento completato. Se la tabella non appare, premi Rerun.")
 
-# ---------- Fixtures – fonti ----------
+# ---------- Fixtures – mappe / helper ----------
 LEAGUE_NAMES = {"I1":"Serie A","E0":"Premier League","SP1":"La Liga","D1":"Bundesliga"}
-FD_COMP      = {"E0":"PL","SP1":"PD","D1":"BL1","I1":"SA"}  # football-data codes
 
 def _safe_df():
     return pd.DataFrame(columns=["date","home","away"])
@@ -166,7 +165,7 @@ def _fbref_fixtures_aggressive(code, days):
         horizon = today + timedelta(days=max(1, int(days)))
         df = df[(df['date'] >= today) & (df['date'] <= horizon)]
         df['home'] = df['home'].astype(str).str.strip()
-        df['away'] = df['away'].astype str().str.strip() if False else df['away'].astype(str).str.strip()
+        df['away'] = df['away'].astype(str).str.strip()
         return df[['date','home','away']].drop_duplicates().reset_index(drop=True), ""
     except requests.HTTPError as e:
         code_msg = getattr(e, 'response', None) and e.response.status_code
