@@ -72,7 +72,7 @@ def auto_update_if_stale(max_age_hours=18):
             ok = run_full_update()
             if ok: st.success("Aggiornamento completato. Se la tabella non appare, premi Rerun.")
 
-# ---------- Fixtures – 3 fonti + FBref “aggressivo” ----------
+# ---------- Fixtures – fonti ----------
 LEAGUE_NAMES = {"I1":"Serie A","E0":"Premier League","SP1":"La Liga","D1":"Bundesliga"}
 FD_COMP      = {"E0":"PL","SP1":"PD","D1":"BL1","I1":"SA"}  # football-data codes
 FBREF_BASE   = {
@@ -81,9 +81,7 @@ FBREF_BASE   = {
     "SP1": "https://fbref.com/en/comps/12/schedule/La-Liga-Scores-and-Fixtures",
     "D1":  "https://fbref.com/en/comps/20/schedule/Bundesliga-Scores-and-Fixtures",
 }
-
-def _safe_df():
-    return pd.DataFrame(columns=["date","home","away"])
+def _safe_df(): return pd.DataFrame(columns=["date","home","away"])
 
 def _season_slug_today():
     today = datetime.date.today()
@@ -91,7 +89,6 @@ def _season_slug_today():
     return f"{start_year}-{start_year+1}"
 
 def _fbref_pick_current_url(code: str) -> str:
-    """Se la pagina base è vecchia, aggancia il link della stagione corrente (2025-2026, ecc.)."""
     base = FBREF_BASE[code]
     try:
         html = requests.get(base, timeout=25).text
@@ -104,7 +101,6 @@ def _fbref_pick_current_url(code: str) -> str:
         return base
 
 def _fbref_fixtures_aggressive(code, days):
-    """Legge la tabella fixture FBref della STAGIONE CORRENTE, filtrando l’orizzonte."""
     try:
         url = _fbref_pick_current_url(code)
         res = requests.get(url, timeout=30)
@@ -114,8 +110,7 @@ def _fbref_fixtures_aggressive(code, days):
         for df in dfs:
             cols = [str(c).strip().lower() for c in df.columns]
             if 'date' in cols and any('home' in c for c in cols) and any('away' in c for c in cols):
-                target = df
-                break
+                target = df; break
         if target is None:
             return _safe_df(), "FBref: tabella non trovata"
         df = target.copy()
@@ -141,8 +136,12 @@ def _fbref_fixtures_aggressive(code, days):
     except Exception as e:
         return _safe_df(), f"FBref err: {type(e).__name__}"
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _fbref_fixtures_aggressive_cached(code, days):
+    return _fbref_fixtures_aggressive(code, days)
+
+@st.cache_data(ttl=600, show_spinner=False)
 def _fpl_fixtures_premier(days):
-    """Premier League via FPL (pubblico, gratis)."""
     try:
         teams = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=20).json().get('teams', [])
         id2name = {t['id']: t['name'] for t in teams}
@@ -154,29 +153,23 @@ def _fpl_fixtures_premier(days):
         rows = []
         for f in fx:
             kt = f.get('kickoff_time')
-            if not kt:
-                continue
+            if not kt: continue
             try:
                 dt_utc = datetime.datetime.fromisoformat(kt.replace('Z', '+00:00'))
-                # data locale approx (per confronto basta la data)
                 d = (dt_utc + (datetime.datetime.now() - datetime.datetime.utcnow())).date()
             except Exception:
                 continue
-            if d < today or d > horizon:
-                continue
-            h = id2name.get(f.get('team_h'))
-            a = id2name.get(f.get('team_a'))
-            if h and a:
-                rows.append({"date": str(d), "home": h.strip(), "away": a.strip()})
+            if d < today or d > horizon: continue
+            h = id2name.get(f.get('team_h')); a = id2name.get(f.get('team_a'))
+            if h and a: rows.append({"date": str(d), "home": h.strip(), "away": a.strip()})
         return (pd.DataFrame(rows).drop_duplicates().reset_index(drop=True) if rows else _safe_df(), "")
     except Exception as e:
         return _safe_df(), f"FPL err: {type(e).__name__}"
 
+@st.cache_data(ttl=600, show_spinner=False)
 def _football_data_fixtures(code, days, api_key):
-    """Fixtures via football-data.org (gratis con chiave; copre PL/PD/BL1/SA)."""
     comp = FD_COMP.get(code.upper())
-    if not comp or not api_key:
-        return _safe_df(), "no key/comp"
+    if not comp or not api_key: return _safe_df(), "no key/comp"
     try:
         today = datetime.date.today()
         horizon = today + timedelta(days=max(1, int(days)))
@@ -189,73 +182,86 @@ def _football_data_fixtures(code, days, api_key):
         rows = []
         for m in js.get("matches", []):
             utc_str = m.get("utcDate")
-            if not utc_str:
-                continue
+            if not utc_str: continue
             try:
                 d = datetime.datetime.fromisoformat(utc_str.replace("Z", "+00:00")).date()
             except Exception:
                 continue
-            if d < today or d > horizon:
-                continue
-            h = m.get("homeTeam", {}).get("name")
-            a = m.get("awayTeam", {}).get("name")
-            if h and a:
-                rows.append({"date": str(d), "home": h.strip(), "away": a.strip()})
+            if d < today or d > horizon: continue
+            h = m.get("homeTeam", {}).get("name"); a = m.get("awayTeam", {}).get("name")
+            if h and a: rows.append({"date": str(d), "home": h.strip(), "away": a.strip()})
         return (pd.DataFrame(rows).drop_duplicates().reset_index(drop=True) if rows else _safe_df(), "")
     except Exception as e:
         return _safe_df(), f"football-data err: {type(e).__name__}"
 
+# -------- Sticky cache: non far sparire La Liga se FBref risponde 429 --------
+def _sticky_merge(current_fixtures, current_diag):
+    prev_fx  = st.session_state.get("last_fixtures", [])
+    prev_diag = st.session_state.get("last_diag", None)
+    # trova riga La Liga in diagnostica
+    try:
+        row = current_diag[current_diag["Lega"]=="La Liga"].iloc[0]
+        partite = int(row["Partite"])
+        errore  = str(row["Errore"])
+    except Exception:
+        partite, errore = 0, ""
+    # se oggi SP1 è 0 e c'è 429, ma prima avevamo dati → ripristina i precedenti
+    if partite == 0 and ("429" in errore or "vuoto" in errore):
+        prev_sp1 = [f for f in prev_fx if f.get("code")=="SP1"]
+        if prev_sp1:
+            # rimuovi eventuali SP1 attuali (vuoti) e unisci i vecchi
+            cur_no_sp1 = [f for f in current_fixtures if f.get("code")!="SP1"]
+            merged = cur_no_sp1 + prev_sp1
+            current_fixtures = sorted(merged, key=lambda x: (x["date"], x["league"], x["home"]))
+            # aggiorna diagnostica
+            try:
+                idx = current_diag.index[current_diag["Lega"]=="La Liga"][0]
+                current_diag.at[idx, "Fonte"] = "cache (FBref)"
+                current_diag.at[idx, "Partite"] = len(prev_sp1)
+                current_diag.at[idx, "Errore"] = "FBref 429 → usata cache 10min"
+            except Exception:
+                pass
+    # salva per i prossimi rerun
+    st.session_state["last_fixtures"] = current_fixtures
+    st.session_state["last_diag"] = current_diag
+    return current_fixtures, current_diag
+
+# ---------- Funzione principale fixtures (con cache 10 min) ----------
 def get_all_fixtures(days=30, use_fd=True, force_fbref_sp1=False):
-    """Lista partite + diagnostica (fonte/errore) per I1/E0/SP1/D1."""
     out, diags = [], []
     for code in ["I1","E0","SP1","D1"]:
-        df = _safe_df()
-        src = None
-        err = ""
-
-        # Se forziamo FBref per La Liga, salta le altre fonti
-        if code == "SP1" and force_fbref_sp1:
-            d3, err3 = _fbref_fixtures_aggressive(code, days)
-            if not d3.empty:
-                df, src, err = d3, "FBref", ""
-            else:
-                err = err3 or "FBref vuoto"
+        df = _safe_df(); src=None; err=""
+        if code=="SP1" and force_fbref_sp1:
+            d3, err3 = _fbref_fixtures_aggressive_cached(code, days)
+            if not d3.empty: df, src, err = d3, "FBref", ""
+            else: err = err3 or "FBref vuoto"
         else:
             # 1) Premier: FPL
-            if code == "E0":
+            if code=="E0":
                 d1, err1 = _fpl_fixtures_premier(days)
-                if not d1.empty:
-                    df, src = d1, "FPL"
-                else:
-                    err = err1
+                if not d1.empty: df, src = d1, "FPL"
+                else: err = err1
             # 2) football-data (se attivo)
             if df.empty and use_fd and API_KEY:
                 d2, err2 = _football_data_fixtures(code, days, API_KEY)
-                if not d2.empty:
-                    df, src, err = d2, "football-data", ""
-                else:
-                    err = (err + " | " + err2).strip(" |")
-            # 3) FBref aggressivo
+                if not d2.empty: df, src, err = d2, "football-data", ""
+                else: err = (err + " | " + err2).strip(" |")
+            # 3) FBref
             if df.empty:
-                d3, err3 = _fbref_fixtures_aggressive(code, days)
-                if not d3.empty:
-                    df, src, err = d3, "FBref", ""
-                else:
-                    err = (err + " | " + err3).strip(" |")
-
+                d3, err3 = _fbref_fixtures_aggressive_cached(code, days)
+                if not d3.empty: df, src, err = d3, "FBref", ""
+                else: err = (err + " | " + err3).strip(" |")
         diags.append({"Lega": LEAGUE_NAMES[code], "Fonte": src or "—", "Partite": len(df), "Errore": err or "—"})
         if not df.empty:
             for _, r in df.iterrows():
-                out.append({
-                    "code": code,
-                    "league": LEAGUE_NAMES[code],
-                    "date": str(r["date"]),
-                    "home": str(r["home"]).strip(),
-                    "away": str(r["away"]).strip(),
-                    "source": src or "—"
-                })
+                out.append({"code": code, "league": LEAGUE_NAMES[code], "date": str(r["date"]),
+                            "home": str(r["home"]).strip(), "away": str(r["away"]).strip(), "source": src or "—"})
     out = sorted(out, key=lambda x: (x["date"], x["league"], x["home"]))
     return out, pd.DataFrame(diags)
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_all_fixtures(days, use_fd, force_fbref_sp1):
+    return get_all_fixtures(days, use_fd, force_fbref_sp1)
 
 # ---------- Modeling helpers ----------
 def compute_lambda_and_var(METRICS, code, home, away, metric):
@@ -321,14 +327,7 @@ try:
     with open('settings.yaml','r',encoding='utf-8') as f:
         CFG = yaml.safe_load(f)
 except Exception:
-    # fallback sicuro
-    CFG = {
-        "staleness_hours": 18,
-        "default_thresholds": {
-            "shots":   [8,10,12,14],
-            "corners": [3,4,5,6]
-        }
-    }
+    CFG = {"staleness_hours": 18, "default_thresholds":{"shots":[8,10,12,14],"corners":[3,4,5,6]}}
 auto_update_if_stale(CFG.get('staleness_hours', 18))
 METRICS = load_json_cached(DATA_PATH)
 CAL     = load_json_cached(CAL_PATH)
@@ -338,9 +337,7 @@ st.sidebar.header("Opzioni")
 horizon   = st.sidebar.number_input("Giorni futuri", 1, 60, 30, 1)
 kick_hour = st.sidebar.slider("Ora indicativa (meteo)", 12, 21, 18)
 use_meteo = st.sidebar.checkbox("Meteo automatico", value=True)
-
-# Interruttori richiesti
-use_fd = st.sidebar.checkbox("Usa football-data.org (API)", value=bool(API_KEY))
+use_fd    = st.sidebar.checkbox("Usa football-data.org (API)", value=bool(API_KEY))
 force_sp1 = st.sidebar.checkbox("Forza FBref per La Liga", value=True)
 
 if st.sidebar.button("🔄 Forza aggiornamento dati"):
@@ -349,15 +346,17 @@ if st.sidebar.button("🔄 Forza aggiornamento dati"):
     if ok: st.success("Aggiornato! Premi Rerun in alto a destra.")
 st.sidebar.caption(f"API football-data: {'✅' if API_KEY else '❌ (opzionale)'}")
 
-# ---------- Recupera TUTTE le partite + Diagnostica ----------
-fixtures, diag_df = get_all_fixtures(days=horizon, use_fd=use_fd, force_fbref_sp1=force_sp1)
+# ---------- Recupera partite + diagnostica (cache 10 min + sticky) ----------
+fixtures, diag_df = fetch_all_fixtures(horizon, use_fd, force_sp1)
+fixtures, diag_df = _sticky_merge(fixtures, diag_df)
+
 with st.expander("🔍 Diagnostica fonti partite"):
     st.write(diag_df)
 
 # ---------- Calcolatore personalizzato ----------
 st.subheader("🧮 Calcolatore personalizzato (tiri singola squadra + angoli totali)")
 
-# Piano B: incolla partite manualmente (aggiunge al menù)
+# Piano B: incolla partite manualmente
 with st.expander("Incolla partite (es. 'Torino - Fiorentina'), una per riga"):
     manual_date = st.text_input("Data (YYYY-MM-DD) per le righe incollate", value=str(datetime.date.today()))
     manual_text = st.text_area("Partite", value="", height=100)
@@ -368,8 +367,7 @@ with st.expander("Incolla partite (es. 'Torino - Fiorentina'), una per riga"):
             if m:
                 fixtures.append({"code":"MAN","league":"Manuale","date":manual_date,"home":m.group(1).strip(),"away":m.group(2).strip(),"source":"Manuale"})
                 added += 1
-        if added:
-            st.success(f"Aggiunte {added} partite manuali.")
+        if added: st.success(f"Aggiunte {added} partite manuali.")
 
 if not fixtures:
     st.info("Nessuna partita trovata nell'orizzonte selezionato. Aumenta 'Giorni futuri' nella sidebar.")
@@ -387,8 +385,7 @@ else:
         th_away = st.number_input(f"Soglia tiri {away} (usa .5, es. 12.5)", min_value=0.0, step=0.5, value=12.5)
 
     # Meteo
-    rain = snow = wind = hot = cold = False
-    meta = None
+    rain=snow=wind=hot=cold=False; meta=None
     if use_meteo:
         latlon = geocode_team_fallback(home, code, autosave=True)
         if latlon and latlon.get("lat") and latlon.get("lon"):
@@ -397,7 +394,7 @@ else:
             wind = wx.get('wind_strong', False); hot = wx.get('hot', False); cold = wx.get('cold', False)
             meta = wx.get('meta', {})
 
-    # Parametri se disponibili
+    # Parametri
     METRICS = load_json_cached(DATA_PATH)
     CAL     = load_json_cached(CAL_PATH)
     shots_params   = compute_lambda_and_var(METRICS, code, home, away, "tiri")
@@ -412,10 +409,8 @@ else:
         lam_h_c = adjust_for_weather(lam_h_c, 'angoli', (rain, snow, wind, hot, cold))
         lam_a_c = adjust_for_weather(lam_a_c, 'angoli', (rain, snow, wind, hot, cold))
 
-        def k_from_half(th):
-            return (int(th) + 1) if ((th % 1) == 0.5) else int(np.floor(th)) + 1
-        def team_over_under(p_over):
-            return round(p_over*100,1), round((1.0-p_over)*100,1)
+        def k_from_half(th): return (int(th) + 1) if ((th % 1) == 0.5) else int(np.floor(th)) + 1
+        def team_over_under(p_over): return round(p_over*100,1), round((1.0-p_over)*100,1)
 
         kH = k_from_half(th_home)
         pH = finalize_probability(kH, lam_h_s, var_factor=vr_h_s, prefer_nb=True)
@@ -458,8 +453,7 @@ else:
         shots_params   = compute_lambda_and_var(METRICS, code, home, away, "tiri")
         corners_params = compute_lambda_and_var(METRICS, code, home, away, "angoli")
         if not shots_params or not corners_params:
-            only_list.append(fx)
-            continue
+            only_list.append(fx); continue
 
         lam_h_s, lam_a_s, vr_h_s, vr_a_s = shots_params
         lam_h_c, lam_a_c, vr_h_c, vr_a_c = corners_params
@@ -494,4 +488,4 @@ else:
         st.markdown("**Partite senza dati completi (mostrate comunque):**")
         st.write(pd.DataFrame(only_list)[['league','date','home','away','source']])
 
-st.caption("Fonti: FPL (PL), football-data.org (se attivo), FBref (stagione corrente, fallback). Meteo: Open-Meteo. Agg. automatico se dati >18h.")
+st.caption("Fonti: FPL (PL), football-data.org (se attivo), FBref (stagione corrente, fallback). Cache 10′ + sticky anti-429 per La Liga. Meteo: Open-Meteo.")
