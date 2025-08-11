@@ -1,7 +1,7 @@
-import json, os, datetime, bisect, subprocess, sys
-import pandas as pd
-import numpy as np
-import streamlit as st
+# --- make repo root importable ---
+import os, sys
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path: sys.path.insert(0, ROOT)
 from pathlib import Path
 from pipeline.modeling.prob_model import combine_strengths, finalize_probability, blended_var_factor
 from pipeline.data_sources.fbref_schedule import get_upcoming_fixtures
