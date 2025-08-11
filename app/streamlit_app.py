@@ -1,23 +1,23 @@
 # --- make repo root importable ---
 import os, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if ROOT not in sys.path: sys.path.insert(0, ROOT)
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+# stdlib / common
+import json, datetime, bisect, subprocess
 from pathlib import Path
+
+# third-party
+import pandas as pd
+import numpy as np
+import streamlit as st  # <--- IMPORTA STREAMLIT PRIMA DI USARE "st"
+
+# local imports (ora funzionano grazie a ROOT nel sys.path)
 from pipeline.modeling.prob_model import combine_strengths, finalize_probability, blended_var_factor
 from pipeline.data_sources.fbref_schedule import get_upcoming_fixtures
 from pipeline.utils.auto_weather import fetch_openmeteo_conditions, LEAGUE_TZ
 from pipeline.utils.geocode import geocode_team_fallback
-
-st.set_page_config(page_title="v7 • Probabilità calibrate + Meteo", layout="wide")
-st.title("v7 • Probabilità calibrate + Meteo • Dashboard automatica")
-
-DATA_PATH = Path('app/public/data/league_team_metrics.json')
-CAL_PATH = Path('app/public/data/calibrators.json')
-STADIUMS_PATH = Path('app/public/data/stadiums.json')
-
-@st.cache_data(show_spinner=False)
-def load_json_cached(path):
-    if Path(path).exists():
         with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
     return {}
