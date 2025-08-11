@@ -31,7 +31,7 @@ STADIUMS_PATH = Path('app/public/data/stadiums.json')
 
 # ---- Helpers ----
 @st.cache_data(show_spinner=False)
-def load_json_cached(path: str):
+def load_json_cached(path):
     p = Path(path)
     if p.exists():
         with open(p, 'r', encoding='utf-8') as f:
@@ -49,12 +49,13 @@ def auto_update_if_stale(max_age_hours=18):
     stale_cal = data_age_hours(CAL_PATH) > max_age_hours
     if stale_metrics or stale_cal:
         with st.spinner("Aggiornamento automatico dei dati in corso..."):
-            r1 = subprocess.run([sys.executable, "pipeline/export_json.py"], capture_output=True, text=True)
-            r2 = subprocess.run([sys.executable, "pipeline/build_calibrators.py"], capture_output=True, text=True)
+            # IMPORTANTISSIMO: avvia come modulo e dalla root del repo
+            r1 = subprocess.run([sys.executable, "-m", "pipeline.export_json"], cwd=ROOT, capture_output=True, text=True)
+            r2 = subprocess.run([sys.executable, "-m", "pipeline.build_calibrators"], cwd=ROOT, capture_output=True, text=True)
             if r1.returncode != 0:
-                st.error("Errore metriche: " + (r1.stderr or r1.stdout)[-300:])
+                st.error("Errore metriche: " + (r1.stderr or r1.stdout)[-400:])
             if r2.returncode != 0:
-                st.error("Errore calibratori: " + (r2.stderr or r2.stdout)[-300:])
+                st.error("Errore calibratori: " + (r2.stderr or r2.stdout)[-400:])
             st.cache_data.clear()
             st.success("Aggiornamento completato. Ricarica se la tabella non appare.")
 
