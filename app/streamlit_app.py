@@ -1,35 +1,28 @@
 # -*- coding: utf-8 -*-
 # ===== streamlit_app.py — v7 FIX TOTALE (file unico) =====
 # Mostra tutte le leghe (Serie A / La Liga / Bundesliga / Premier) con WorldFootball.
-# Ha fallback completi se i moduli 'pipeline' non esistono:
+# Ha fallback completi se i moduli 'pipeline' non ci sono:
 #  - Modello probabilistico Poisson/NegBin semplificato interno
 #  - Costruzione METRICS da football-data.co.uk (stagione scorsa + corrente)
 #  - Meteo via Open-Meteo senza chiavi
-#
-# Se i tuoi JSON/pipepline ci sono, li usa. Se non ci sono, funziona lo stesso.
 
-# --- make repo root importable ---
-import os, sys
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
-
-# stdlib
-import json, re, time, datetime
+import os, sys, json, re, time, datetime, unicodedata, io
 from datetime import timedelta, date
 from pathlib import Path
-import unicodedata
 
-# third-party
 import pandas as pd
 import numpy as np
 import requests
 import streamlit as st
 import yaml
-from scipy.stats import poisson  # per il fallback
-import io
+from scipy.stats import poisson
 
-# ====== TENTATIVO IMPORT PIPELINE (con fallback) ======
+# --- path repo (se serve pipeline) ---
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+# ====== prova import pipeline (con fallback) ======
 HAVE_PIPELINE = True
 try:
     from pipeline.modeling.prob_model import combine_strengths, finalize_probability, blended_var_factor
@@ -38,11 +31,9 @@ try:
 except Exception:
     HAVE_PIPELINE = False
 
-    # ----- Fallback meteo / geocode -----
     LEAGUE_TZ = {"I1":"Europe/Rome","E0":"Europe/London","SP1":"Europe/Madrid","D1":"Europe/Berlin"}
 
     def geocode_team_fallback(name, code, autosave=True):
-        # usa Open-Meteo geocoding libero
         try:
             r = requests.get("https://geocoding-api.open-meteo.com/v1/search",
                              params={"name": name, "count": 1, "language": "en"},
@@ -56,7 +47,6 @@ except Exception:
         return {"lat": None, "lon": None, "name": None}
 
     def fetch_openmeteo_conditions(lat, lon, date_iso, hour_local=18, tz="Europe/Rome"):
-        # semplificazione: prendiamo l’ora 17:00 locale se c’è, altrimenti la prima della data
         try:
             params = {
                 "latitude": lat, "longitude": lon,
@@ -66,20 +56,18 @@ except Exception:
             }
             r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=20)
             js = r.json()
-            hourly = js.get("hourly", {})
-            times = hourly.get("time", [])
-            temps = hourly.get("temperature_2m", [])
-            precs = hourly.get("precipitation", [])
-            winds = hourly.get("wind_speed_10m", [])
-            target = date_iso
+            hh = js.get("hourly", {})
+            times = hh.get("time", [])
+            temps = hh.get("temperature_2m", [])
+            precs = hh.get("precipitation", [])
+            winds = hh.get("wind_speed_10m", [])
             idx = None
-            # cerchiamo ore della stessa data
             for i, t in enumerate(times):
-                if t.startswith(target) and t.endswith(f"{hour_local:02d}:00"):
+                if t.startswith(date_iso) and t.endswith(f"{hour_local:02d}:00"):
                     idx = i; break
             if idx is None:
                 for i, t in enumerate(times):
-                    if t.startswith(target):
+                    if t.startswith(date_iso):
                         idx = i; break
             if idx is None:
                 return {}
@@ -99,9 +87,8 @@ except Exception:
         except Exception:
             return {}
 
-    # ----- Fallback modeling -----
+    # ---- fallback modeling ----
     def combine_strengths(team_for, league_for, opp_against, league_against, league_mean, home_adj=1.0):
-        # prodotto normalizzato semplice + aggiustamento casa/trasferta
         if any(pd.isna([team_for, league_for, opp_against, league_against, league_mean])):
             return None
         f = team_for / max(1e-9, league_for)
@@ -110,55 +97,39 @@ except Exception:
         return float(max(0.05, lam))
 
     def blended_var_factor(v_for, v_against, league_vr, lo=1.0, hi=2.0):
-        # se non ci sono varianze, usa ratio di lega o 1.2
         vals = [x for x in [v_for, v_against, league_vr] if isinstance(x,(int,float)) and x>0]
         if not vals: return 1.2
         v = float(np.median(vals))
         return float(min(max(v, lo), hi))
 
     def _neg_bin_cdf(k, lam, var_ratio):
-        # usa Poisson se var_ratio ~1, altrimenti NegBin approssimata
         if lam <= 0: return 0.0
         if var_ratio <= 1.05:
             return float(poisson.cdf(k, lam))
-        # NegBin parametrizzazione: mean=lam, var = lam * var_ratio => p = mean/var, r = mean*p/(1-p)
         var = lam * var_ratio
         p = lam / var
-        if p <= 0 or p >= 1:  # fallback
+        if p <= 0 or p >= 1:
             return float(poisson.cdf(k, lam))
         r = lam * p / (1 - p)
-        # CDF NB(k; r, p) = I_{p}(r, k+1) (incomplete beta). Evitiamo dipendenze: approssimiamo sommando PMF
-        # PMF: C(k+r-1, k) * (1-p)^k * p^r
         from math import lgamma, exp, log
         def log_pmf(x):
             return (lgamma(x+r) - lgamma(r) - lgamma(x+1)) + r*log(p) + x*log(1-p)
-        # somma fino a k (può essere costosa per k grande; per soglie qui va bene)
-        m = min(int(k)+60, int(max(5*lam, k+60)))  # taglia code
-        # normalizzazione
-        # uso accumulo in spazio log per stabilità
-        mx = None
-        logs = []
+        m = min(int(k)+60, int(max(5*lam, k+60)))
+        mx = None; logs = []
         for x in range(0, m+1):
-            lp = log_pmf(x)
-            logs.append(lp)
-            mx = lp if (mx is None or lp > mx) else mx
+            lp = log_pmf(x); logs.append(lp); mx = lp if (mx is None or lp > mx) else mx
         s = sum(exp(l - mx) for l in logs[:int(k)+1])
         z = sum(exp(l - mx) for l in logs)
         return float(s / max(1e-12, z))
 
     def finalize_probability(k_int, lam, var_factor=1.2, prefer_nb=True):
-        # ritorna P(X >= k_int)
         if lam is None or lam <= 0:
             return 0.0
-        # CDF fino a k-1
         k = int(k_int) - 1
-        if prefer_nb:
-            cdf = _neg_bin_cdf(k, lam, var_factor)
-        else:
-            cdf = float(poisson.cdf(k, lam))
+        cdf = _neg_bin_cdf(k, lam, var_factor) if prefer_nb else float(poisson.cdf(k, lam))
         return float(max(0.0, min(1.0, 1.0 - cdf)))
 
-# ---------- Page ----------
+# ---------- pagina ----------
 st.set_page_config(page_title="v7 • Probabilità calibrate + Meteo", layout="wide")
 st.title("v7 • Probabilità calibrate + Meteo • Dashboard automatica")
 
@@ -187,23 +158,19 @@ def load_json_cached(path):
 
 def data_age_hours(path: Path) -> float:
     p = Path(path)
-    if not p.exists():
-        return 1e9
+    if not p.exists(): return 1e9
     return (datetime.datetime.now().timestamp() - p.stat().st_mtime) / 3600.0
 
 def run_full_update():
-    # Se pipeline esiste, lanciamo i moduli; altrimenti segnaliamo ok (non bloccare app)
     if HAVE_PIPELINE:
         import subprocess
         r1 = subprocess.run([sys.executable, "-m", "pipeline.export_json"], cwd=ROOT, capture_output=True, text=True)
         r2 = subprocess.run([sys.executable, "-m", "pipeline.build_calibrators"], cwd=ROOT, capture_output=True, text=True)
         ok = True
         if r1.returncode != 0:
-            st.error("Errore metriche: " + (r1.stderr or r1.stdout)[-500:])
-            ok = False
+            st.error("Errore metriche: " + (r1.stderr or r1.stdout)[-500:]); ok = False
         if r2.returncode != 0:
-            st.error("Errore calibratori: " + (r2.stderr or r2.stdout)[-500:])
-            ok = False
+            st.error("Errore calibratori: " + (r2.stderr or r2.stdout)[-500:]); ok = False
         st.cache_data.clear()
         return ok
     else:
@@ -212,22 +179,18 @@ def run_full_update():
         return True
 
 def auto_update_if_stale(max_age_hours=18):
-    stale_metrics = data_age_hours(DATA_PATH) > max_age_hours
-    stale_cal     = data_age_hours(CAL_PATH)  > max_age_hours
-    if stale_metrics or stale_cal:
+    if data_age_hours(DATA_PATH) > max_age_hours or data_age_hours(CAL_PATH) > max_age_hours:
         with st.spinner("Aggiornamento automatico dei dati in corso..."):
             ok = run_full_update()
             if ok:
                 st.success("Aggiornamento completato. Se la tabella non appare, premi Rerun.")
 
-# ---------- Fixtures – mappe / helper ----------
+# ---------- Fixtures / normalizzazione ----------
 LEAGUE_NAMES = {"I1":"Serie A","E0":"Premier League","SP1":"La Liga","D1":"Bundesliga"}
 ALL_CODES = ["I1","E0","SP1","D1"]
 
-def _safe_df():
-    return pd.DataFrame(columns=["date","home","away"])
+def _safe_df(): return pd.DataFrame(columns=["date","home","away"])
 
-# ---------- Cache su disco (persistente) ----------
 def _read_fix_cache():
     try:
         if FIX_CACHE.exists():
@@ -248,25 +211,20 @@ def _write_fix_cache(code, df, source):
 
 def _load_from_fix_cache(code, days):
     cache = _read_fix_cache()
-    if code not in cache:
-        return _safe_df(), "cache: vuota"
+    if code not in cache: return _safe_df(), "cache: vuota"
     rows = cache[code].get("rows", [])
-    if not rows:
-        return _safe_df(), "cache: vuota"
+    if not rows: return _safe_df(), "cache: vuota"
     today = date.today()
     horizon = today + timedelta(days=max(1, int(days)))
     keep = [r for r in rows if today <= date.fromisoformat(r["date"]) <= horizon]
-    if not keep:
-        return _safe_df(), "cache: nessuna data nell’orizzonte"
+    if not keep: return _safe_df(), "cache: nessuna data nell’orizzonte"
     df = pd.DataFrame(keep)
     return df[["date","home","away"]].drop_duplicates().reset_index(drop=True), ""
 
-# ---------- Normalizzazione nomi (per allineare WorldFootball ↔ metriche) ----------
 def strip_accents(s):
     return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
 
 ALIASES = {
-    # La Liga
     ("SP1","Athletic Bilbao"): "Athletic Club",
     ("SP1","Atletico Madrid"): "Atlético Madrid",
     ("SP1","Real Betis Sevilla"): "Real Betis",
@@ -277,7 +235,6 @@ ALIASES = {
     ("SP1","Girona FC"): "Girona",
     ("SP1","Granada CF"): "Granada",
     ("SP1","Sevilla FC"): "Sevilla",
-    # Serie A
     ("I1","Internazionale"): "Inter",
     ("I1","AS Roma"): "Roma",
     ("I1","SS Lazio"): "Lazio",
@@ -288,7 +245,6 @@ ALIASES = {
     ("I1","ACF Fiorentina"): "Fiorentina",
     ("I1","US Salernitana"): "Salernitana",
     ("I1","SSC Napoli"): "Napoli",
-    # Bundesliga
     ("D1","Borussia Moenchengladbach"): "Borussia Mönchengladbach",
     ("D1","1. FC Koeln"): "Köln",
     ("D1","1. FC Union Berlin"): "Union Berlin",
@@ -298,8 +254,7 @@ ALIASES = {
 def normalize_name(code, name):
     name_clean = re.sub(r'\s+', ' ', str(name)).strip()
     key = (code, name_clean)
-    if key in ALIASES:
-        return ALIASES[key]
+    if key in ALIASES: return ALIASES[key]
     s = strip_accents(name_clean)
     s = re.sub(r'\b(CF|FC|UD|CD|SD)\b\.?', '', s, flags=re.I).strip()
     s = re.sub(r'\s+', ' ', s)
@@ -308,19 +263,17 @@ def normalize_name(code, name):
     if code=="I1" and s.lower()=="internazionale": return "Inter"
     return name_clean
 
-# ---------- FONTE 0: FPL (Premier) ----------
+# --- FPL (Premier) ---
 @st.cache_data(ttl=600, show_spinner=False)
 def _fpl_fixtures_premier(days):
     try:
         teams = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=20).json().get('teams', [])
         id2name = {t['id']: t['name'] for t in teams}
         fx = requests.get("https://fantasy.premierleague.com/api/fixtures/", timeout=30).json()
-        if not isinstance(fx, list):
-            return _safe_df(), "FPL: risposta inattesa"
+        if not isinstance(fx, list): return _safe_df(), "FPL: risposta inattesa"
         today = date.today()
         horizon = today + timedelta(days=max(1, int(days)))
         rows = []
-        # conversione UTC->locale semplice
         offset = (datetime.datetime.now() - datetime.datetime.utcnow())
         for f in fx:
             kt = f.get('kickoff_time')
@@ -339,7 +292,7 @@ def _fpl_fixtures_premier(days):
     except Exception as e:
         return _safe_df(), f"FPL err: {type(e).__name__}"
 
-# ---------- FONTE 1: WorldFootball (Serie A, La Liga, Bundesliga) ----------
+# --- WorldFootball (Serie A, La Liga, Bundesliga) ---
 WF_SLUG = {"I1":"ita-serie-a", "SP1":"esp-primera-division", "D1":"bundesliga"}
 
 def _season_slug_today():
@@ -350,25 +303,17 @@ def _season_slug_today():
 def _ua_session():
     s = requests.Session()
     s.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0 Safari/537.36"
-        ),
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/124.0 Safari/537.36"),
         "Accept-Language": "en,en-GB;q=0.9"
     })
     return s
 
 @st.cache_data(ttl=900, show_spinner=False)
 def _worldfootball_fixtures(code, days):
-    """
-    Legge i calendari da worldfootball provando PRIMA 'schedule' e poi 'all_matches'.
-    Riconosce varie intestazioni (Home team/Home/Away team/Away), unisce tutte le tabelle e filtra per orizzonte futuro.
-    """
     slug = WF_SLUG.get(code)
-    if not slug:
-        return _safe_df(), "WF: slug mancante"
-
+    if not slug: return _safe_df(), "WF: slug mancante"
     try:
         season = _season_slug_today()
         sess = _ua_session()
@@ -376,9 +321,7 @@ def _worldfootball_fixtures(code, days):
             f"https://www.worldfootball.net/schedule/{slug}-{season}/",
             f"https://www.worldfootball.net/all_matches/{slug}-{season}/",
         ]
-        frames = []
-        errs = []
-
+        frames = []; errs = []
         for url in urls:
             try:
                 resp = sess.get(url, timeout=30)
@@ -388,55 +331,46 @@ def _worldfootball_fixtures(code, days):
                 tables = pd.read_html(resp.text)
                 for t in tables:
                     cols_lower = [str(c).strip().lower() for c in t.columns]
-                    rename_map = {}
-                    if "home team" in cols_lower: rename_map[t.columns[cols_lower.index("home team")]] = "home"
-                    if "away team" in cols_lower: rename_map[t.columns[cols_lower.index("away team")]] = "away"
-                    if "home" in cols_lower:      rename_map[t.columns[cols_lower.index("home")]]      = "home"
-                    if "away" in cols_lower:      rename_map[t.columns[cols_lower.index("away")]]      = "away"
-                    if "date" in cols_lower:      rename_map[t.columns[cols_lower.index("date")]]      = "date"
-                    t = t.rename(columns=rename_map)
-                    if not all(k in t.columns for k in ["date", "home", "away"]):
-                        continue
-                    tt = t[["date", "home", "away"]].copy()
+                    ren = {}
+                    if "home team" in cols_lower: ren[t.columns[cols_lower.index("home team")]] = "home"
+                    if "away team" in cols_lower: ren[t.columns[cols_lower.index("away team")]] = "away"
+                    if "home" in cols_lower:      ren[t.columns[cols_lower.index("home")]]      = "home"
+                    if "away" in cols_lower:      ren[t.columns[cols_lower.index("away")]]      = "away"
+                    if "date" in cols_lower:      ren[t.columns[cols_lower.index("date")]]      = "date"
+                    t = t.rename(columns=ren)
+                    if not all(k in t.columns for k in ["date","home","away"]): continue
+                    tt = t[["date","home","away"]].copy()
                     tt["date"] = pd.to_datetime(tt["date"], dayfirst=True, errors="coerce").dt.date
                     tt = tt.dropna(subset=["date","home","away"])
-                    if not tt.empty:
-                        frames.append(tt)
+                    if not tt.empty: frames.append(tt)
             except Exception as e:
                 errs.append(f"{url.split('/')[3]} {type(e).__name__}")
 
         if not frames:
             msg = "WF: nessuna tabella"
-            if errs:
-                msg += " | " + " | ".join(errs)
+            if errs: msg += " | " + " | ".join(errs)
             return _safe_df(), msg
 
         df = pd.concat(frames, ignore_index=True).drop_duplicates()
         today = date.today()
         horizon = today + timedelta(days=max(1, int(days)))
         df = df[(df["date"] >= today) & (df["date"] <= horizon)]
-
         df["home"] = df["home"].astype(str).str.strip().map(lambda s: normalize_name(code, s))
         df["away"] = df["away"].astype(str).str.strip().map(lambda s: normalize_name(code, s))
         df = df.drop_duplicates().reset_index(drop=True)
-
-        if df.empty:
-            return _safe_df(), "WF: nessuna partita nell'orizzonte"
-
+        if df.empty: return _safe_df(), "WF: nessuna partita nell'orizzonte"
         _write_fix_cache(code, df, "WorldFootball")
         return df, ""
-
     except requests.HTTPError as e:
         return _safe_df(), f"WF HTTP {getattr(e.response, 'status_code', '')}"
     except Exception as e:
         return _safe_df(), f"WF err: {type(e).__name__}"
 
-# ---------- FONTE 2: football-data.org (facoltativa) ----------
+# --- football-data.org (facoltativo) ---
 @st.cache_data(ttl=600, show_spinner=False)
 def _football_data_fixtures(code, days, api_key):
     comp = {"E0":"PL","SP1":"PD","D1":"BL1","I1":"SA"}.get(code.upper())
-    if not comp or not api_key:
-        return _safe_df(), "no key/comp"
+    if not comp or not api_key: return _safe_df(), "no key/comp"
     try:
         today = date.today()
         horizon = today + timedelta(days=max(1, int(days)))
@@ -463,7 +397,7 @@ def _football_data_fixtures(code, days, api_key):
     except Exception as e:
         return _safe_df(), f"football-data err: {type(e).__name__}"
 
-# -------- Sticky cache (se oggi fallisce, tieni l'ultima lista buona) --------
+# --- sticky cache tra run ---
 def _sticky_merge(current_fixtures, current_diag):
     prev_fx  = st.session_state.get("last_fixtures", [])
     prev_diag = st.session_state.get("last_diag", None)
@@ -489,31 +423,22 @@ def _sticky_merge(current_fixtures, current_diag):
     st.session_state["last_diag"] = current_diag
     return current_fixtures, current_diag
 
-# ---------- Funzione principale fixtures ----------
 def get_all_fixtures(days=30, use_fd=False, use_local_cache=True, use_worldfootball=True):
     out, diags = [], []
     for code in ALL_CODES:
         df = _safe_df(); src=None; err=""
-
-        # 0) Premier via FPL
         if code=="E0":
             d1, err1 = _fpl_fixtures_premier(days)
             if not d1.empty: df, src = d1, "FPL"
             else: err = err1
-
-        # 1) WorldFootball (per I1/SP1/D1) – PRIMA SCELTA
         if df.empty and use_worldfootball and code in WF_SLUG:
             dWF, errWF = _worldfootball_fixtures(code, days)
             if not dWF.empty: df, src, err = dWF, "WorldFootball", ""
             else: err = (err + " | " + errWF).strip(" |")
-
-        # 2) football-data (facoltativo)
         if df.empty and use_fd and API_KEY:
             d2, err2 = _football_data_fixtures(code, days, API_KEY)
             if not d2.empty: df, src, err = d2, "football-data", ""
             else: err = (err + " | " + err2).strip(" |")
-
-        # 3) Cache su disco (persistente)
         if df.empty and use_local_cache:
             d4, err4 = _load_from_fix_cache(code, days)
             if not d4.empty: df, src, err = d4, "cache", (err + " | cache").strip(" |")
@@ -531,9 +456,7 @@ def get_all_fixtures(days=30, use_fd=False, use_local_cache=True, use_worldfootb
 def fetch_all_fixtures(days, use_fd, use_local_cache, use_worldfootball):
     return get_all_fixtures(days, use_fd, use_local_cache, use_worldfootball)
 
-# ====== FALLBACK METRICS (se mancano i JSON della pipeline) ======
-LEAGUE_CODES_FD = {"E0":"Premier League","I1":"Serie A","SP1":"La Liga","D1":"Bundesliga"}
-
+# ====== METRICS fallback da football-data.co.uk ======
 @st.cache_data(ttl=6*3600)
 def _fd_fetch_csv(season_yyzz: str, code: str) -> pd.DataFrame:
     url = f"https://www.football-data.co.uk/mmz4281/{season_yyzz}/{code}.csv"
@@ -556,11 +479,9 @@ def _season_yyzz_today():
     return f"{str(start_year)[-2:]}{str(end_year)[-2:]}", start_year, end_year
 
 def _metrics_from_fd():
-    """Crea METRICS stile pipeline partendo dai CSV football-data della stagione scorsa + corrente."""
     yyzz, sy, ey = _season_yyzz_today()
     last = f"{str(sy-1)[-2:]}{str(sy)[-2:]}"
     cur  = yyzz
-
     full = {}
     for code in ALL_CODES:
         df_last = _fd_fetch_csv(last, code)
@@ -579,7 +500,6 @@ def _metrics_from_fd():
             for c in ["HS","AS","HC","AC"]:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
             df = df.dropna(subset=["HomeTeam","AwayTeam","HS","AS","HC","AC"])
-            # medie
             shots_home_for = df["HS"].mean(); shots_away_for = df["AS"].mean()
             corners_home_for = df["HC"].mean(); corners_away_for = df["AC"].mean()
             league_means = {
@@ -592,7 +512,6 @@ def _metrics_from_fd():
                 "corners_home_against": float(corners_away_for),
                 "corners_away_against": float(corners_home_for),
             }
-            # var ratio di lega (grossolana)
             vr = {
                 "shots_home_for": float((df["HS"].var(ddof=1) or shots_home_for)/max(1e-9, shots_home_for)),
                 "shots_away_for": float((df["AS"].var(ddof=1) or shots_away_for)/max(1e-9, shots_away_for)),
@@ -630,21 +549,19 @@ def _metrics_from_fd():
             full[code] = {"teams":{}, "league_means":{}, "league_var_ratio":{}}
             continue
 
-        # Fusione: 70% last + 30% current (semplice)
         if not m_last.empty and not m_cur.empty:
             w_cur = 0.3
             teams = sorted(set(m_last["team"]).union(set(m_cur["team"])))
             rows = []
+            def W(xlast, xcur):
+                if (xlast is None or pd.isna(xlast)) and (xcur is None or pd.isna(xcur)): return np.nan
+                if xlast is None or pd.isna(xlast): return float(xcur)
+                if xcur is None or pd.isna(xcur):  return float(xlast)
+                return float((1-w_cur)*xlast + w_cur*xcur)
             for t in teams:
-                a = m_last[m_last["team"]==t]
-                b = m_cur[m_cur["team"]==t]
+                a = m_last[m_last["team"]==t]; b = m_cur[m_cur["team"]==t]
                 a = a.iloc[0] if len(a) else None
                 b = b.iloc[0] if len(b) else None
-                def W(xlast, xcur):
-                    if (xlast is None or pd.isna(xlast)) and (xcur is None or pd.isna(xcur)): return np.nan
-                    if xlast is None or pd.isna(xlast): return float(xcur)
-                    if xcur is None or pd.isna(xcur):  return float(xlast)
-                    return float((1-w_cur)*xlast + w_cur*xcur)
                 row = {"team": t}
                 for k in ["shots_for_home","shots_for_away","shots_against_home","shots_against_away",
                           "corners_for_home","corners_for_away","corners_against_home","corners_against_away",
@@ -653,7 +570,6 @@ def _metrics_from_fd():
                     v_last = a[k] if a is not None and k in a else np.nan
                     v_cur  = b[k] if b is not None and k in b else np.nan
                     row[k] = W(v_last, v_cur)
-                # league means/var
                 lm_last = extra_last.get("league_means", {})
                 lm_cur  = extra_cur.get("league_means", {})
                 league_means = {}
@@ -707,27 +623,65 @@ def compute_lambda_and_var(METRICS, code, home, away, metric):
     return lam_home, lam_away, vr_home, vr_away
 
 def apply_isotonic(CAL, code, metric, side_key, k_int, p):
-    if not CAL: return p
-    if metric == "tiri": metric_key = "shots"
-    elif metric == "angoli": metric_key = "corners"
-    elif metric == "angoli_tot": metric_key = "corners_total"
-    else: return p
-    cal = CAL.get(code, {}).get(metric_key, {}).get(side_key, {})
-    if not cal: return p
-    key = str(int(k_int))
-    if key not in cal:
-        keys = sorted([int(x) for x in cal.keys()]) if cal else []
-        if not keys: return p
-        key = str(min(keys, key=lambda x: abs(x - int(k_int))))
-    xs, ys = cal['x'], cal['y']
-    if p <= xs[0]: return ys[0]
-    if p >= xs[-1]: return ys[-1]
-    import bisect
-    j = bisect.bisect_right(xs, p) - 1
-    j = max(0, min(j, len(xs)-2))
-    x0,x1=xs[j], xs[j+1]; y0,y1=ys[j], ys[j+1]
-    t = 0 if x1==x0 else (p-x0)/(x1-x0)
-    return y0 + t*(y1-y0)
+    """
+    Applica la calibrazione se disponibile, altrimenti restituisce p.
+    Supporta vari formati:
+      - CAL[code][metric_key][side_key] = {'x':[...],'y':[...]}
+      - CAL[code][metric_key][side_key][k] = {'x':[...],'y':[...]}  (per soglia intera k)
+    Se mancano 'x'/'y' o non sono liste valide, ritorna p (no crash).
+    """
+    try:
+        if not CAL: return p
+        if metric == "tiri": metric_key = "shots"
+        elif metric == "angoli": metric_key = "corners"
+        elif metric == "angoli_tot": metric_key = "corners_total"
+        else: return p
+
+        node = CAL.get(code, {}).get(metric_key, {}).get(side_key, None)
+        if not node: 
+            return p
+
+        # Caso A: direttamente {'x':..., 'y':...}
+        if isinstance(node, dict) and ("x" in node and "y" in node):
+            xs, ys = node["x"], node["y"]
+        else:
+            # Caso B: dict per soglie -> scegli la più vicina a k_int
+            key = str(int(k_int))
+            entry = None
+            if isinstance(node, dict) and key in node:
+                entry = node[key]
+            elif isinstance(node, dict):
+                # prova a trovare la soglia più vicina
+                nums = [int(k) for k in node.keys() if str(k).isdigit()]
+                if nums:
+                    nearest = str(min(nums, key=lambda kk: abs(kk - int(k_int))))
+                    entry = node.get(nearest)
+            if not isinstance(entry, dict):
+                return p
+            xs = entry.get("x") or entry.get("xs") or entry.get("X")
+            ys = entry.get("y") or entry.get("ys") or entry.get("Y")
+
+        # validazione liste
+        if not (isinstance(xs, (list, tuple)) and isinstance(ys, (list, tuple)) and len(xs) >= 2 and len(xs) == len(ys)):
+            return p
+
+        # ordina per x e interpola
+        pairs = sorted(zip(xs, ys), key=lambda t: t[0])
+        xs = [float(a) for a, _ in pairs]
+        ys = [float(b) for _, b in pairs]
+
+        if p <= xs[0]: return ys[0]
+        if p >= xs[-1]: return ys[-1]
+        import bisect
+        j = bisect.bisect_right(xs, p) - 1
+        j = max(0, min(j, len(xs)-2))
+        x0, x1 = xs[j], xs[j+1]
+        y0, y1 = ys[j], ys[j+1]
+        t = 0.0 if x1 == x0 else (p - x0) / (x1 - x0)
+        return y0 + t*(y1 - y0)
+    except Exception:
+        # Qualsiasi problema di struttura/calcolo -> usa p non calibrato
+        return p
 
 def adjust_for_weather(lam, metric_name, flags):
     rain, snow, wind, hot, cold = flags
@@ -748,11 +702,11 @@ except Exception:
 
 auto_update_if_stale(CFG.get('staleness_hours', 18))
 
-# Carica METRICS/CAL se presenti, altrimenti costruisci fallback
+# Carica METRICS/CAL; se non ci sono, costruisci fallback
 METRICS = load_json_cached(DATA_PATH)
 CAL     = load_json_cached(CAL_PATH)
 if not METRICS:
-    with st.spinner("Creo metriche di fallback dalla stagione scorsa + corrente (football-data.co.uk)..."):
+    with st.spinner("Creo metriche di fallback (football-data.co.uk)..."):
         METRICS = _metrics_from_fd()
 
 # ---------- Sidebar ----------
@@ -767,8 +721,7 @@ use_worldfootball = st.sidebar.checkbox("Usa WorldFootball (consigliato)", value
 if st.sidebar.button("🔄 Forza aggiornamento dati"):
     with st.spinner("Rigenero storico e calibratori..."):
         ok = run_full_update()
-    if ok:
-        st.success("Aggiornato! Premi Rerun in alto a destra.")
+    if ok: st.success("Aggiornato! Premi Rerun in alto a destra.")
 
 # ---------- Recupera partite + diagnostica ----------
 fixtures, diag_df = fetch_all_fixtures(horizon, use_fd, use_local_cache, use_worldfootball)
@@ -788,10 +741,10 @@ with st.expander("Incolla partite (es. 'Torino - Fiorentina'), una per riga"):
         for line in manual_text.splitlines():
             m = re.match(r"^\s*(.+?)\s*[-–]\s*(.+?)\s*$", line)
             if m:
-                fixtures.append({"code":"MAN","league":"Manuale","date":manual_date,"home":m.group(1).strip(),"away":m.group(2).strip(),"source":"Manuale"})
+                fixtures.append({"code":"MAN","league":"Manuale","date":manual_date,
+                                 "home":m.group(1).strip(),"away":m.group(2).strip(),"source":"Manuale"})
                 added += 1
-        if added:
-            st.success(f"Aggiunte {added} partite manuali.")
+        if added: st.success(f"Aggiunte {added} partite manuali.")
 
 if not fixtures:
     st.info("Nessuna partita trovata nell'orizzonte selezionato. Aumenta 'Giorni futuri' nella sidebar.")
@@ -816,29 +769,22 @@ else:
             wx = fetch_openmeteo_conditions(latlon["lat"], latlon["lon"], date_iso, hour_local=kick_hour, tz=tz) or {}
             rain = wx.get('rain', False); snow = wx.get('snow', False)
             wind = wx.get('wind_strong', False); hot = wx.get('hot', False); cold = wx.get('cold', False)
-        else:
-            wx = {}
 
     # Parametri
-    METRICS = METRICS or {}
-    CAL     = CAL or {}
     shots_params   = compute_lambda_and_var(METRICS, code, home, away, "tiri")
     corners_params = compute_lambda_and_var(METRICS, code, home, away, "angoli")
     if not shots_params:
         st.warning("Dati squadra non trovati in METRICS per questa partita.")
     else:
         lam_h_s, lam_a_s, vr_h_s, vr_a_s = shots_params
+        lam_h_c=lam_a_c=vr_h_c=vr_a_c=None
         if corners_params:
             lam_h_c, lam_a_c, vr_h_c, vr_a_c = corners_params
-        else:
-            lam_h_c=lam_a_c=vr_h_c=vr_a_c=None
 
         lam_h_s = adjust_for_weather(lam_h_s, 'tiri', (rain, snow, wind, hot, cold))
         lam_a_s = adjust_for_weather(lam_a_s, 'tiri', (rain, snow, wind, hot, cold))
-        if lam_h_c is not None:
-            lam_h_c = adjust_for_weather(lam_h_c, 'angoli', (rain, snow, wind, hot, cold))
-        if lam_a_c is not None:
-            lam_a_c = adjust_for_weather(lam_a_c, 'angoli', (rain, snow, wind, hot, cold))
+        if lam_h_c is not None: lam_h_c = adjust_for_weather(lam_h_c, 'angoli', (rain, snow, wind, hot, cold))
+        if lam_a_c is not None: lam_a_c = adjust_for_weather(lam_a_c, 'angoli', (rain, snow, wind, hot, cold))
 
         def k_from_half(th): return (int(th) + 1) if ((th % 1) == 0.5) else int(np.floor(th)) + 1
         kH = k_from_half(th_home)
@@ -854,7 +800,7 @@ else:
         st.markdown(f"**Probabilità tiri – {home}**: Over {th_home} ➜ **{oh}%**, Under {th_home} ➜ **{uh}%**")
         st.markdown(f"**Probabilità tiri – {away}**: Over {th_away} ➜ **{oa}%**, Under {th_away} ➜ **{ua}%**")
 
-        # Angoli totali over vari
+        # Angoli totali
         st.markdown("**Angoli totali – Over automatici**")
         if lam_h_c is None or lam_a_c is None or lam_h_c<=0 or lam_a_c<=0:
             st.info("Dati corner incompleti: mostro solo tiri.")
