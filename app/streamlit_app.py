@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
-# ===== streamlit_app.py — v8 (API-FOOTBALL primaria, FD fallback, zero scraping) =====
+# ===== streamlit_app.py — v8.1 (API-FOOTBALL primaria, FD fallback, zero scraping) =====
 # - Calendari: API-FOOTBALL → stabile; fallback football-data.org; FPL per PL.
 # - Metriche: stagione scorsa da football-data.co.uk (+ opzionale corrente al 30%).
 # - Meteo: Open-Meteo (gratis).
-# - Matching nomi squadra robusto (alias + fuzzy) per allineare fixtures ↔ metriche.
-# - NIENTE SciPy: Poisson CDF implementato a mano (stabile per i nostri range).
-# - Calcolatore: soglie .5 per tiri (singola squadra) e over standard per angoli totali.
+# - Matching nomi robusto: alias estesi + fuzzy con normalizzazioni (Bundesliga inclusa).
+# - Poisson/NBinom implementati senza SciPy.
 
 import os, sys, io, json, re, time, datetime, unicodedata
 from datetime import date, timedelta
@@ -88,7 +87,7 @@ except Exception:
         except Exception:
             return {}
 
-    # ---- fallback modeling (se pipeline non c'è) ----
+    # ---- fallback modeling ----
     def combine_strengths(team_for, league_for, opp_against, league_against, league_mean, home_adj=1.0):
         vals = [team_for, league_for, opp_against, league_against, league_mean]
         if any(v is None or (isinstance(v,float) and np.isnan(v)) for v in vals):
@@ -142,11 +141,11 @@ except Exception:
         return float(max(0.0, min(1.0, 1.0 - cdf)))
 
 # ---------- pagina ----------
-st.set_page_config(page_title="v8 • Probabilità calibrate + Meteo", layout="wide")
-st.title("v8 • Probabilità calibrate + Meteo • Dashboard automatica")
+st.set_page_config(page_title="v8.1 • Probabilità calibrate + Meteo", layout="wide")
+st.title("v8.1 • Probabilità calibrate + Meteo • Dashboard automatica")
 
 # ---------- Paths ----------
-DATA_PATH = Path('app/public/data/league_team_metrics.json')   # (non obbligatori in v8)
+DATA_PATH = Path('app/public/data/league_team_metrics.json')   # (non obbligatori in v8.x)
 CAL_PATH  = Path('app/public/data/calibrators.json')
 FIX_CACHE = Path('app/public/data/fixtures_cache.json')
 FIX_CACHE.parent.mkdir(parents=True, exist_ok=True)
@@ -173,11 +172,11 @@ except Exception:
 def _safe_df(): return pd.DataFrame(columns=["date","home","away"])
 
 def strip_accents(s):
-    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+    return ''.join(c for c in unicodedata.normalize('NFD', str(s)) if unicodedata.category(c) != 'Mn')
 
 # alias → target: NOMI COME IN football-data.co.uk (metriche stagione scorsa)
 ALIASES_METRICS = {
-    # La Liga (FD tende a usare abbreviazioni)
+    # La Liga
     ("SP1","Athletic Club"): "Ath Bilbao",
     ("SP1","Athletic Bilbao"): "Ath Bilbao",
     ("SP1","Atletico Madrid"): "Atl Madrid",
@@ -185,9 +184,13 @@ ALIASES_METRICS = {
     ("SP1","Real Betis"): "Betis",
     ("SP1","Real Sociedad"): "Sociedad",
     ("SP1","Deportivo Alaves"): "Alaves",
+    ("SP1","Alavés"): "Alaves",
     ("SP1","Celta Vigo"): "Celta",
+    ("SP1","Cádiz"): "Cadiz",
     ("SP1","Cadiz"): "Cadiz",
     ("SP1","Sevilla FC"): "Sevilla",
+    ("SP1","Rayo Vallecano"): "Vallecano",
+    ("SP1","UD Las Palmas"): "Las Palmas",
     # Serie A
     ("I1","Internazionale"): "Inter",
     ("I1","SS Lazio"): "Lazio",
@@ -199,48 +202,68 @@ ALIASES_METRICS = {
     ("I1","US Salernitana"): "Salernitana",
     ("I1","SSC Napoli"): "Napoli",
     ("I1","ACF Fiorentina"): "Fiorentina",
-    # Bundesliga (FD spesso: M'gladbach, Koln)
+    # Bundesliga (esteso)
+    ("D1","FC Bayern München"): "Bayern Munich",
+    ("D1","Bayern München"): "Bayern Munich",
+    ("D1","Bayern Munich"): "Bayern Munich",
+    ("D1","Borussia Dortmund"): "Dortmund",
+    ("D1","Bayer 04 Leverkusen"): "Leverkusen",
+    ("D1","Bayer Leverkusen"): "Leverkusen",
     ("D1","Borussia Mönchengladbach"): "M'gladbach",
     ("D1","Borussia Moenchengladbach"): "M'gladbach",
     ("D1","1. FC Köln"): "FC Koln",
     ("D1","1. FC Koeln"): "FC Koln",
+    ("D1","VfB Stuttgart"): "Stuttgart",
+    ("D1","VfL Wolfsburg"): "Wolfsburg",
+    ("D1","TSG Hoffenheim"): "Hoffenheim",
+    ("D1","Eintracht Frankfurt"): "Frankfurt",
+    ("D1","SC Freiburg"): "Freiburg",
+    ("D1","FC Augsburg"): "Augsburg",
+    ("D1","RB Leipzig"): "RB Leipzig",
+    ("D1","1. FC Union Berlin"): "Union Berlin",
     ("D1","FSV Mainz 05"): "Mainz",
-    ("D1","Union Berlin"): "Union Berlin",
+    ("D1","1. FC Heidenheim"): "Heidenheim",
+    ("D1","SV Darmstadt 98"): "Darmstadt",
+    ("D1","VfL Bochum"): "Bochum",
 }
 
 def _canon(s):
-    s = strip_accents(str(s)).lower()
+    s = strip_accents(s).lower()
+    # normalizzazioni utili DE
+    s = s.replace("muenchen","munich").replace("munchen","munich")
+    s = s.replace("monchengladbach","mgladbach").replace("mönchengladbach","mgladbach")
+    s = s.replace("koln","koln").replace("cologne","koln")  # fd usa "FC Koln"
+    # pulizia
     s = re.sub(r'[^a-z0-9]+', ' ', s).strip()
-    return re.sub(r'\b(cf|fc|ud|cd|sd|club|de|la|real)\b', '', s).strip()
+    # rimuovi prefissi/comuni
+    s = re.sub(r'\b(cf|fc|ud|cd|sd|club|de|la|real|borussia|eintracht|tsg|vfl|vfb|sc)\b', '', s).strip()
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
 
 def match_team_name(code, name, teams_available):
-    # 1) alias diretti
+    # alias espliciti
     key = (code, str(name).strip())
     if key in ALIASES_METRICS:
         return ALIASES_METRICS[key]
-    # 2) match esatto
+    # esatto
     if name in teams_available:
         return name
-    # 3) fuzzy semplice su forma canonica
+    # fuzzy
     target_map = {t: _canon(t) for t in teams_available}
     name_c = _canon(name)
-    # punteggio massimo
     best_t, best_score = None, 0.0
     for t, c in target_map.items():
         if not c: continue
-        # overlap token
-        set_a = set(name_c.split())
-        set_b = set(c.split())
+        set_a, set_b = set(name_c.split()), set(c.split())
         if not set_a or not set_b: continue
         inter = len(set_a & set_b)
         uni   = len(set_a | set_b)
         score = inter / max(1, uni)
         if score > best_score:
             best_t, best_score = t, score
-    if best_t and best_score >= 0.5:
+    if best_t and best_score >= 0.34:   # soglia più permissiva (München/Munich, ecc.)
         return best_t
-    # 4) ultima spiaggia: ritorna name (potrà fallire il lookup)
-    return name
+    return name  # fallback
 
 def normalize_for_metrics(code, home, away, METRICS):
     teams = list(METRICS.get(code, {}).get('teams', {}).keys())
@@ -251,6 +274,7 @@ def normalize_for_metrics(code, home, away, METRICS):
     return h, a
 
 # ---------- Cache fixtures su disco ----------
+FIX_CACHE.parent.mkdir(parents=True, exist_ok=True)
 def _read_fix_cache():
     try:
         if FIX_CACHE.exists():
@@ -694,7 +718,7 @@ home, away = normalize_for_metrics(code, home_raw, away_raw, METRICS)
 
 st.write(f"### {home_raw} vs {away_raw} — {fx['league']} — {date_iso}")
 if (home != home_raw) or (away != away_raw):
-    st.caption(f"Allineamento per metriche: {home_raw}→{home} • {away_raw}→{away}")
+    st.caption(f"Allineamento per metriche: {home_raw} → {home} • {away_raw} → {away}")
 
 # Meteo
 rain=snow=wind=hot=cold=False
