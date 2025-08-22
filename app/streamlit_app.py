@@ -1,11 +1,7 @@
 # -*- coding: utf-8 -*-
-# ===== streamlit_app.py — v8.7 (FIX alias RB Leipzig → Leipzig; alias extra; away fix confermato) =====
-# - Calendari: API-FOOTBALL (primaria) • fallback: football-data.org • FPL per Premier.
-# - Metriche: stagione scorsa football-data.co.uk (+ opzionale stagione corrente 30%).
-# - Meteo: Open-Meteo (gratis).
-# - Matching robusto + alias estesi (Liga/BL) e fuzzy.
-# - Fallback automatico per squadre senza storico.
-# - BUGFIX v8.6: per l’AWAY usa medie “away” (non “home”). v8.7: RB Leipzig → Leipzig.
+# ===== streamlit_app.py — v9.1 =====
+# Novità v9.1: menù a tendina per CAMPIONATO -> poi menù PARTITE filtrato.
+# Tutto il resto (alias, auto-apprendimento, meteo, probabilità) invariato.
 
 import os, sys, io, json, re, time, datetime, unicodedata
 from datetime import date, timedelta
@@ -96,11 +92,11 @@ except Exception:
         f = team_for / max(1e-9, league_for)
         g = opp_against / max(1e-9, league_against)
         lam = f * g * league_mean * home_adj
-        return float(max(0.05, lam))
+        return float(max(0.05, min(lam, 40.0)))
 
-    def blended_var_factor(v_for, v_against, league_vr, lo=1.0, hi=2.0):
+    def blended_var_factor(v_for, v_against, league_vr, lo=1.0, hi=2.5):
         vals = [x for x in [v_for, v_against, league_vr] if isinstance(x,(int,float)) and x>0]
-        if not vals: return 1.2
+        if not vals: return 1.25
         v = float(np.median(vals))
         return float(min(max(v, lo), hi))
 
@@ -134,7 +130,7 @@ except Exception:
         z = sum(exp(l - mx) for l in logs)
         return float(s / max(1e-12, z))
 
-    def finalize_probability(k_int, lam, var_factor=1.2, prefer_nb=True):
+    def finalize_probability(k_int, lam, var_factor=1.25, prefer_nb=True):
         if lam is None or lam <= 0:
             return 0.0
         k = int(k_int) - 1
@@ -142,13 +138,14 @@ except Exception:
         return float(max(0.0, min(1.0, 1.0 - cdf)))
 
 # ---------- pagina ----------
-st.set_page_config(page_title="v8.7 • Probabilità calibrate + Meteo", layout="wide")
-st.title("v8.7 • Probabilità calibrate + Meteo • Dashboard automatica")
+st.set_page_config(page_title="v9.1 • Probabilità calibrate + Meteo", layout="wide")
+st.title("v9.1 • Probabilità calibrate + Meteo • Dashboard automatica")
 
 # ---------- Paths ----------
-DATA_PATH = Path('app/public/data/league_team_metrics.json')   # (non obbligatori in v8.x)
+DATA_PATH = Path('app/public/data/league_team_metrics.json')  # (non obbligatori in v9.x)
 CAL_PATH  = Path('app/public/data/calibrators.json')
 FIX_CACHE = Path('app/public/data/fixtures_cache.json')
+LEARNED_ALIASES = Path('app/public/data/learned_aliases.json')
 FIX_CACHE.parent.mkdir(parents=True, exist_ok=True)
 
 # ---------- Secrets ----------
@@ -169,115 +166,188 @@ try:
 except Exception:
     CFG = {"staleness_hours": 18, "default_thresholds":{"shots":[8,10,12,14],"corners":[3,4,5,6]}}
 
-# ---------- Utility ----------
 def _safe_df(): return pd.DataFrame(columns=["date","home","away"])
+def strip_accents(s): return ''.join(c for c in unicodedata.normalize('NFD', str(s)) if unicodedata.category(c) != 'Mn')
 
-def strip_accents(s):
-    return ''.join(c for c in unicodedata.normalize('NFD', str(s)) if unicodedata.category(c) != 'Mn')
-
-# alias → target: nomi come in football-data.co.uk (metriche stagione scorsa)
-ALIASES_METRICS = {
-    # La Liga
-    ("SP1","Athletic Club"): "Ath Bilbao",
-    ("SP1","Athletic Bilbao"): "Ath Bilbao",
-    ("SP1","Club Atlético de Madrid"): "Atl Madrid",
-    ("SP1","Atletico Madrid"): "Atl Madrid",
-    ("SP1","Atlético Madrid"): "Atl Madrid",
-    ("SP1","FC Barcelona"): "Barcelona",
-    ("SP1","Futbol Club Barcelona"): "Barcelona",
-    ("SP1","Barcelona"): "Barcelona",
-    ("SP1","Real Madrid CF"): "Real Madrid",
-    ("SP1","Real Madrid"): "Real Madrid",
-    ("SP1","Real Sociedad de Fútbol"): "Sociedad",
-    ("SP1","Real Sociedad de Futbol"): "Sociedad",
-    ("SP1","Real Sociedad"): "Sociedad",
-    ("SP1","RCD Espanyol de Barcelona"): "Espanyol",
-    ("SP1","Espanyol"): "Espanyol",
-    ("SP1","Elche CF"): "Elche",
-    ("SP1","Elche"): "Elche",
-    ("SP1","Levante UD"): "Levante",
-    ("SP1","Levante"): "Levante",
-    ("SP1","RCD Mallorca"): "Mallorca",
-    ("SP1","Mallorca"): "Mallorca",
-    ("SP1","RC Celta de Vigo"): "Celta",
-    ("SP1","Celta de Vigo"): "Celta",
-    ("SP1","Celta Vigo"): "Celta",
-    ("SP1","Real Oviedo"): "Oviedo",
-    ("SP1","Oviedo"): "Oviedo",
-    ("SP1","Real Betis"): "Betis",
-    ("SP1","Real Sociedad San Sebastian"): "Sociedad",
-
-    # Serie A
-    ("I1","Internazionale"): "Inter",
-    ("I1","SS Lazio"): "Lazio",
-    ("I1","AS Roma"): "Roma",
-    ("I1","AC Milan"): "AC Milan",
-    ("I1","Hellas Verona"): "Verona",
-    ("I1","US Sassuolo"): "Sassuolo",
-    ("I1","Udinese Calcio"): "Udinese",
-    ("I1","US Salernitana"): "Salernitana",
-    ("I1","SSC Napoli"): "Napoli",
-    ("I1","ACF Fiorentina"): "Fiorentina",
-
-    # Bundesliga (estesi)  **RB Leipzig fix → Leipzig**
-    ("D1","FC Bayern München"): "Bayern Munich",
-    ("D1","Bayern München"): "Bayern Munich",
-    ("D1","Bayern Munich"): "Bayern Munich",
-    ("D1","Borussia Dortmund"): "Dortmund",
-    ("D1","Bayer 04 Leverkusen"): "Leverkusen",
-    ("D1","Bayer Leverkusen"): "Leverkusen",
-    ("D1","Borussia Mönchengladbach"): "M'gladbach",
-    ("D1","Borussia Moenchengladbach"): "M'gladbach",
-    ("D1","Borussia Monchengladbach"): "M'gladbach",
-    ("D1","1. FC Köln"): "FC Koln",
-    ("D1","1. FC Koeln"): "FC Koln",
-    ("D1","1 FC Koln"): "FC Koln",
-    ("D1","FC Koln"): "FC Koln",
-    ("D1","VfB Stuttgart"): "Stuttgart",
-    ("D1","VfL Wolfsburg"): "Wolfsburg",
-    ("D1","Wolfsburg"): "Wolfsburg",
-    ("D1","TSG Hoffenheim"): "Hoffenheim",
-    ("D1","1899 Hoffenheim"): "Hoffenheim",
-    ("D1","Eintracht Frankfurt"): "Frankfurt",
-    ("D1","SC Freiburg"): "Freiburg",
-    ("D1","FC Augsburg"): "Augsburg",
-    ("D1","RB Leipzig"): "Leipzig",                 # <-- FIX QUI
-    ("D1","RasenBallsport Leipzig"): "Leipzig",     # alias aggiuntivo
-    ("D1","1. FC Union Berlin"): "Union Berlin",
-    ("D1","FSV Mainz 05"): "Mainz",
-    ("D1","Mainz 05"): "Mainz",
-    ("D1","1. FC Heidenheim"): "Heidenheim",
-    ("D1","1. FC Heidenheim 1846"): "Heidenheim",
-    ("D1","Heidenheim 1846"): "Heidenheim",
-    ("D1","FC Heidenheim 1846"): "Heidenheim",
-    ("D1","1 FC Heidenheim 1846"): "Heidenheim",
-    ("D1","VfL Bochum"): "Bochum",
-    ("D1","SV Werder Bremen"): "Werder Bremen",
-    ("D1","Werder Bremen"): "Werder Bremen",
-    ("D1","Hamburger SV"): "Hamburg",
-    ("D1","Hamburg SV"): "Hamburg",
-    ("D1","Hamburg"): "Hamburg",
+# ===== Alias statici (italiano + varianti) → target (candidati multipli) =====
+ALIASES_STATIC = {
+    # (… identico alla v9.0: alias completi per Serie A, La Liga, Bundesliga, Premier …)
+    # --- Per brevità: lascia qui TUTTO il blocco ALIASES_STATIC della v9.0 senza modifiche ---
+    ("I1","Inter"): ["Inter"],
+    ("I1","Internazionale"): ["Inter"],
+    ("I1","Juventus"): ["Juventus"],
+    ("I1","Milan"): ["AC Milan","Milan"],
+    ("I1","AC Milan"): ["AC Milan","Milan"],
+    ("I1","Roma"): ["Roma","AS Roma"],
+    ("I1","AS Roma"): ["Roma","AS Roma"],
+    ("I1","Lazio"): ["Lazio","SS Lazio"],
+    ("I1","SS Lazio"): ["Lazio","SS Lazio"],
+    ("I1","Napoli"): ["Napoli","SSC Napoli"],
+    ("I1","Fiorentina"): ["Fiorentina","ACF Fiorentina"],
+    ("I1","Atalanta"): ["Atalanta"],
+    ("I1","Torino"): ["Torino"],
+    ("I1","Bologna"): ["Bologna"],
+    ("I1","Verona"): ["Verona","Hellas Verona"],
+    ("I1","Hellas Verona"): ["Verona","Hellas Verona"],
+    ("I1","Udinese"): ["Udinese","Udinese Calcio"],
+    ("I1","Sassuolo"): ["Sassuolo","US Sassuolo"],
+    ("I1","Cagliari"): ["Cagliari"],
+    ("I1","Empoli"): ["Empoli"],
+    ("I1","Genoa"): ["Genoa"],
+    ("I1","Lecce"): ["Lecce","US Lecce"],
+    ("I1","Monza"): ["Monza"],
+    ("I1","Parma"): ["Parma"],
+    ("I1","Salernitana"): ["Salernitana","US Salernitana"],
+    ("I1","Frosinone"): ["Frosinone"],
+    ("I1","Venezia"): ["Venezia"],
+    ("I1","Brescia"): ["Brescia"],
+    ("I1","Spezia"): ["Spezia"],
+    ("I1","Palermo"): ["Palermo"],
+    ("SP1","Real Madrid"): ["Real Madrid"],
+    ("SP1","Barcellona"): ["Barcelona","FC Barcelona"],
+    ("SP1","Barcelona"): ["Barcelona","FC Barcelona"],
+    ("SP1","Atlético Madrid"): ["Atl Madrid","Atletico Madrid"],
+    ("SP1","Atletico Madrid"): ["Atl Madrid","Atletico Madrid"],
+    ("SP1","Athletic Bilbao"): ["Ath Bilbao","Athletic Club"],
+    ("SP1","Athletic Club"): ["Ath Bilbao","Athletic Club"],
+    ("SP1","Real Sociedad"): ["Sociedad","Real Sociedad"],
+    ("SP1","Real Sociedad de Fútbol"): ["Sociedad","Real Sociedad"],
+    ("SP1","Villarreal"): ["Villarreal"],
+    ("SP1","Valencia"): ["Valencia"],
+    ("SP1","Sevilla"): ["Sevilla","Sevilla FC"],
+    ("SP1","Betis"): ["Betis","Real Betis"],
+    ("SP1","Celta Vigo"): ["Celta","Celta Vigo"],
+    ("SP1","Celta"): ["Celta","Celta Vigo"],
+    ("SP1","Osasuna"): ["Osasuna"],
+    ("SP1","Rayo Vallecano"): ["Rayo Vallecano","Vallecano"],
+    ("SP1","Getafe"): ["Getafe"],
+    ("SP1","Mallorca"): ["Mallorca","RCD Mallorca"],
+    ("SP1","Espanyol"): ["Espanyol","RCD Espanyol"],
+    ("SP1","Alavés"): ["Alaves","Deportivo Alaves"],
+    ("SP1","Alaves"): ["Alaves","Deportivo Alaves"],
+    ("SP1","Cadice"): ["Cadiz","Cadiz CF","Cádiz"],
+    ("SP1","Cádiz"): ["Cadiz","Cadiz CF","Cádiz"],
+    ("SP1","Girona"): ["Girona","Girona FC"],
+    ("SP1","Granada"): ["Granada","Granada CF"],
+    ("SP1","Las Palmas"): ["Las Palmas","UD Las Palmas"],
+    ("SP1","Valladolid"): ["Valladolid","Real Valladolid"],
+    ("SP1","Leganés"): ["Leganes","CD Leganes"],
+    ("SP1","Leganes"): ["Leganes","CD Leganes"],
+    ("SP1","Elche"): ["Elche","Elche CF"],
+    ("SP1","Oviedo"): ["Oviedo","Real Oviedo"],
+    ("D1","Bayern Monaco"): ["Bayern Munich","Bayern München"],
+    ("D1","Bayern München"): ["Bayern Munich","Bayern München"],
+    ("D1","Bayern Munich"): ["Bayern Munich","Bayern München"],
+    ("D1","Borussia Dortmund"): ["Dortmund","Borussia Dortmund"],
+    ("D1","Bayer Leverkusen"): ["Leverkusen","Bayer Leverkusen"],
+    ("D1","Leverkusen"): ["Leverkusen","Bayer Leverkusen"],
+    ("D1","Borussia Mönchengladbach"): ["M'gladbach","Borussia Monchengladbach","Borussia Moenchengladbach"],
+    ("D1","Monchengladbach"): ["M'gladbach","Borussia Monchengladbach","Borussia Moenchengladbach"],
+    ("D1","Colonia"): ["FC Koln","Cologne","1. FC Köln","1. FC Koeln"],
+    ("D1","1. FC Köln"): ["FC Koln","1. FC Koeln","Cologne"],
+    ("D1","Hoffenheim"): ["Hoffenheim","1899 Hoffenheim"],
+    ("D1","Eintracht Francoforte"): ["Frankfurt","Eintracht Frankfurt"],
+    ("D1","Eintracht Frankfurt"): ["Frankfurt","Eintracht Frankfurt"],
+    ("D1","Friburgo"): ["Freiburg","SC Freiburg"],
+    ("D1","Friburgo in Brisgovia"): ["Freiburg","SC Freiburg"],
+    ("D1","Augusta"): ["Augsburg","FC Augsburg"],
+    ("D1","Stoccarda"): ["Stuttgart","VfB Stuttgart"],
+    ("D1","Wolfsburg"): ["Wolfsburg","VfL Wolfsburg"],
+    ("D1","Union Berlino"): ["Union Berlin","1. FC Union Berlin"],
+    ("D1","Mainz"): ["Mainz","Mainz 05","FSV Mainz 05"],
+    ("D1","Mainz 05"): ["Mainz","Mainz 05","FSV Mainz 05"],
+    ("D1","RB Lipsia"): ["RB Leipzig","Leipzig","RasenBallsport Leipzig"],
+    ("D1","RB Leipzig"): ["RB Leipzig","Leipzig","RasenBallsport Leipzig"],
+    ("D1","Leipzig"): ["Leipzig","RB Leipzig","RasenBallsport Leipzig"],
+    ("D1","Amburgo"): ["Hamburg","Hamburger SV","Hamburg SV"],
+    ("D1","Hamburger SV"): ["Hamburg","Hamburger SV","Hamburg SV"],
+    ("D1","Werder Brema"): ["Werder Bremen","SV Werder Bremen"],
+    ("D1","Werder Bremen"): ["Werder Bremen","SV Werder Bremen"],
+    ("D1","Bochum"): ["Bochum","VfL Bochum"],
+    ("D1","Heidenheim"): ["Heidenheim","1. FC Heidenheim 1846","Heidenheim 1846","FC Heidenheim 1846"],
+    ("D1","Köln"): ["FC Koln","1. FC Köln","1. FC Koeln"],
+    ("E0","Arsenal"): ["Arsenal"],
+    ("E0","Aston Villa"): ["Aston Villa"],
+    ("E0","Bournemouth"): ["Bournemouth","AFC Bournemouth"],
+    ("E0","Brentford"): ["Brentford"],
+    ("E0","Brighton"): ["Brighton","Brighton & Hove Albion"],
+    ("E0","Chelsea"): ["Chelsea"],
+    ("E0","Crystal Palace"): ["Crystal Palace"],
+    ("E0","Everton"): ["Everton"],
+    ("E0","Fulham"): ["Fulham"],
+    ("E0","Liverpool"): ["Liverpool"],
+    ("E0","Luton"): ["Luton","Luton Town"],
+    ("E0","Manchester City"): ["Man City","Manchester City"],
+    ("E0","Man City"): ["Man City","Manchester City"],
+    ("E0","Manchester United"): ["Man United","Manchester United"],
+    ("E0","Man United"): ["Man United","Manchester United"],
+    ("E0","Newcastle"): ["Newcastle","Newcastle United"],
+    ("E0","Nottingham Forest"): ["Nottm Forest","Nottingham Forest"],
+    ("E0","Nottm Forest"): ["Nottm Forest","Nottingham Forest"],
+    ("E0","Sheffield United"): ["Sheffield United","Sheff Utd"],
+    ("E0","Tottenham"): ["Tottenham","Tottenham Hotspur"],
+    ("E0","West Ham"): ["West Ham","West Ham United"],
+    ("E0","Wolverhampton"): ["Wolves","Wolverhampton","Wolverhampton Wanderers"],
+    ("E0","Wolves"): ["Wolves","Wolverhampton","Wolverhampton Wanderers"],
+    ("E0","Leicester"): ["Leicester","Leicester City"],
+    ("E0","Southampton"): ["Southampton"],
+    ("E0","Leeds"): ["Leeds","Leeds United"],
+    ("E0","Ipswich"): ["Ipswich","Ipswich Town"],
+    ("E0","Burnley"): ["Burnley"],
 }
+
+# === Learned aliases (persistenti su file) ===
+LEARNED_ALIASES = Path('app/public/data/learned_aliases.json')
+def _read_learned():
+    try:
+        if LEARNED_ALIASES.exists():
+            return json.loads(LEARNED_ALIASES.read_text(encoding='utf-8'))
+    except Exception:
+        pass
+    return {}
+
+def _write_learned(dct):
+    try:
+        LEARNED_ALIASES.parent.mkdir(parents=True, exist_ok=True)
+        LEARNED_ALIASES.write_text(json.dumps(dct, ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception:
+        pass
+
+LEARNED = _read_learned()
 
 def _canon(s):
     s = strip_accents(s).lower()
     s = s.replace("muenchen","munich").replace("munchen","munich")
     s = s.replace("monchengladbach","mgladbach").replace("mönchengladbach","mgladbach")
-    s = s.replace("koln","koln").replace("cologne","koln")
+    s = s.replace("cologne","koln").replace("köln","koln")
     s = s.replace("hamburger","hamburg")
-    # rimuovi numeri (Schalke 04, 1846, 05…)
     s = re.sub(r'\b\d+\b', ' ', s)
     s = re.sub(r'[^a-z0-9]+', ' ', s).strip()
-    s = re.sub(r'\b(cf|fc|ud|cd|sd|sv|rc|rcd|club|de|la|real|futbol|borussia|eintracht|tsg|vfl|vfb|sc)\b', '', s).strip()
+    s = re.sub(r'\b(cf|fc|ud|cd|sd|sv|rc|rcd|ud|club|de|la|real|futbol|borussia|eintracht|tsg|vfl|vfb|sc|ac|ss)\b', '', s).strip()
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
 def match_team_name(code, name, teams_available):
     key = (code, str(name).strip())
-    if key in ALIASES_METRICS:
-        return ALIASES_METRICS[key]
+    # 1) learned
+    if str(key) in LEARNED:
+        cand = LEARNED[str(key)]
+        if cand in teams_available:
+            return cand
+    # 2) static
+    if key in ALIASES_STATIC:
+        cand_list = ALIASES_STATIC[key]
+        if isinstance(cand_list, str):
+            cand_list = [cand_list]
+        for c in cand_list:
+            if c in teams_available:
+                LEARNED[str(key)] = c
+                _write_learned(LEARNED)
+                return c
+    # 3) esatto
     if name in teams_available:
         return name
+    # 4) fuzzy
     target_map = {t: _canon(t) for t in teams_available}
     name_c = _canon(name)
     best_t, best_score = None, 0.0
@@ -290,7 +360,9 @@ def match_team_name(code, name, teams_available):
         score = inter / max(1, uni)
         if score > best_score:
             best_t, best_score = t, score
-    if best_t and best_score >= 0.34:
+    if best_t and best_score >= 0.30:
+        LEARNED[str(key)] = best_t
+        _write_learned(LEARNED)
         return best_t
     return name
 
@@ -301,37 +373,6 @@ def normalize_for_metrics(code, home, away, METRICS):
     h = match_team_name(code, home, teams)
     a = match_team_name(code, away, teams)
     return h, a
-
-# ---------- Cache fixtures su disco ----------
-def _safe_cache_read():
-    try:
-        if FIX_CACHE.exists():
-            return json.loads(FIX_CACHE.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {}
-
-def _cache_write(code, df, source):
-    try:
-        cache = _safe_cache_read()
-        rows = [{"date": str(r["date"]), "home": str(r["home"]), "away": str(r["away"]), "source": source}
-                for _, r in df.iterrows()]
-        cache[code] = {"updated_at": int(time.time()), "rows": rows}
-        FIX_CACHE.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
-
-def _cache_load(code, days):
-    cache = _safe_cache_read()
-    if code not in cache: return _safe_df(), "cache: vuota"
-    rows = cache[code].get("rows", [])
-    if not rows: return _safe_df(), "cache: vuota"
-    today = date.today()
-    horizon = today + timedelta(days=max(1, int(days)))
-    keep = [r for r in rows if today <= date.fromisoformat(r["date"]) <= horizon]
-    if not keep: return _safe_df(), "cache: nessuna data nell’orizzonte"
-    df = pd.DataFrame(keep)
-    return df[["date","home","away"]].drop_duplicates().reset_index(drop=True), ""
 
 # ---------- FPL (Premier fallback) ----------
 @st.cache_data(ttl=600, show_spinner=False)
@@ -357,7 +398,6 @@ def _fpl_fixtures_premier(days):
             h = id2name.get(f.get('team_h')); a = id2name.get(f.get('team_a'))
             if h and a: rows.append({"date": str(d), "home": h.strip(), "away": a.strip()})
         df = pd.DataFrame(rows).drop_duplicates().reset_index(drop=True) if rows else _safe_df()
-        if not df.empty: _cache_write("E0", df, "FPL")
         return df, ""
     except Exception as e:
         return _safe_df(), f"FPL err: {type(e).__name__}"
@@ -368,12 +408,7 @@ COMP_MAP = {"E0":"PL","I1":"SA","SP1":"PD","D1":"BL1"}
 def _fd_call(days, api_key, shrink=False):
     today = date.today()
     horizon = today + timedelta(days=(5 if shrink else max(1, int(days))))
-    params = {
-        "dateFrom": str(today),
-        "dateTo": str(horizon),
-        "competitions": ",".join(COMP_MAP.values()),
-        "status": "SCHEDULED,POSTPONED"
-    }
+    params = {"dateFrom": str(today), "dateTo": str(horizon), "competitions": ",".join(COMP_MAP.values()), "status": "SCHEDULED,POSTPONED"}
     headers = {"X-Auth-Token": api_key}
     return requests.get("https://api.football-data.org/v4/matches", params=params, headers=headers, timeout=30)
 
@@ -651,34 +686,36 @@ def compute_lambda_and_var(METRICS, code, home, away, metric):
     ta, _ = _team_profile_or_fallback(METRICS, code, away)
 
     if metric == "tiri":
-        # HOME
         team_for_home       = th.get('shots_for_home')
         league_for_home     = league_means.get('shots_home_for')
         opp_against_away    = ta.get('shots_against_away')
         league_against_away = league_means.get('shots_away_against')
-        # AWAY (uso medie AWAY)
+
         team_for_away       = ta.get('shots_for_away')
         league_for_away     = league_means.get('shots_away_for')
         opp_against_home    = th.get('shots_against_home')
         league_against_home = league_means.get('shots_home_against')
+
         league_mean         = (league_means.get('shots_home_for',np.nan) + league_means.get('shots_away_for',np.nan))/2.0
         H_home, H_away      = 1.05, 0.95
-        vr_home = blended_var_factor(th.get('vr_shots_for_home'), ta.get('vr_shots_against_away'), league_vr.get('shots_home_for', 1.1), 1.0, 2.0)
-        vr_away = blended_var_factor(ta.get('vr_shots_for_away'), th.get('vr_shots_against_home'), league_vr.get('shots_away_for', 1.1), 1.0, 2.0)
+        vr_home = blended_var_factor(th.get('vr_shots_for_home'), ta.get('vr_shots_against_away'), league_vr.get('shots_home_for', 1.15), 1.0, 2.2)
+        vr_away = blended_var_factor(ta.get('vr_shots_for_away'), th.get('vr_shots_against_home'), league_vr.get('shots_away_for', 1.15), 1.0, 2.2)
 
     else:
         team_for_home       = th.get('corners_for_home')
         league_for_home     = league_means.get('corners_home_for')
         opp_against_away    = ta.get('corners_against_away')
         league_against_away = league_means.get('corners_away_against')
+
         team_for_away       = ta.get('corners_for_away')
         league_for_away     = league_means.get('corners_away_for')
         opp_against_home    = th.get('corners_against_home')
         league_against_home = league_means.get('corners_home_against')
+
         league_mean         = (league_means.get('corners_home_for',np.nan) + league_means.get('corners_away_for',np.nan))/2.0
         H_home, H_away      = 1.03, 0.97
-        vr_home = blended_var_factor(th.get('vr_corners_for_home'), ta.get('vr_corners_against_away'), league_vr.get('corners_home_for', 1.3), 1.1, 2.5)
-        vr_away = blended_var_factor(ta.get('vr_corners_for_away'), th.get('vr_corners_against_home'), league_vr.get('corners_away_for', 1.3), 1.1, 2.5)
+        vr_home = blended_var_factor(th.get('vr_corners_for_home'), ta.get('vr_corners_against_away'), league_vr.get('corners_home_for', 1.35), 1.1, 2.6)
+        vr_away = blended_var_factor(ta.get('vr_corners_for_away'), th.get('vr_corners_against_home'), league_vr.get('corners_away_for', 1.35), 1.1, 2.6)
 
     lam_home = combine_strengths(team_for_home, league_for_home, opp_against_away, league_against_away, league_mean, H_home)
     lam_away = combine_strengths(team_for_away, league_for_away, opp_against_home, league_against_home, league_mean, H_away)
@@ -737,11 +774,11 @@ kick_hour = st.sidebar.slider("Ora indicativa (meteo)", 12, 21, 18)
 use_meteo = st.sidebar.checkbox("Meteo automatico", value=True)
 include_current_season = st.sidebar.checkbox("Includi stagione corrente nelle metriche (30%)", value=False)
 
-# ---------- Costruisci metriche ----------
+# ---------- Metriche ----------
 with st.spinner("Costruisco metriche (stagione scorsa)..."):
     METRICS = _metrics_build(only_last=not include_current_season, include_cur_weight=0.3)
 
-# ---------- Fixtures: API-FOOTBALL primaria, FD fallback, FPL per PL ----------
+# ---------- Fixtures ----------
 with st.spinner("Recupero partite (API-FOOTBALL)..."):
     fixtures, diag1 = _api_football_fixtures_all(days, API_FOOTBALL_KEY)
 
@@ -751,7 +788,7 @@ if not fixtures:
     fixtures = fx_fd
     diag_frames.append(diag_fd)
 
-# Premier League: fallback FPL se necessario
+# Premier League: fallback FPL se necessario (aggiunge solo PL mancanti)
 if not any(f.get("code")=="E0" for f in fixtures):
     fpl_df, fpl_err = _fpl_fixtures_premier(days)
     if not fpl_df.empty:
@@ -762,7 +799,6 @@ if not any(f.get("code")=="E0" for f in fixtures):
 
 diag = pd.concat(diag_frames, ignore_index=True) if len(diag_frames)>1 else diag_frames[0]
 
-# Diagnostica
 with st.expander("🔍 Diagnostica fonti partite"):
     st.dataframe(diag if isinstance(diag, pd.DataFrame) else pd.DataFrame(diag), use_container_width=True)
 
@@ -770,28 +806,45 @@ if not fixtures:
     st.warning("Nessuna partita trovata. Verifica le chiavi nei Secrets e riduci i giorni a 7–10.")
     st.stop()
 
+# --------- NUOVO: filtro per campionato ---------
+present_leagues = sorted({f['league'] for f in fixtures})
+league_choice = st.selectbox("Scegli il campionato", ["Tutti"] + present_leagues, index=0)
+fixtures_view = fixtures if league_choice == "Tutti" else [f for f in fixtures if f['league'] == league_choice]
+
+if not fixtures_view:
+    st.info("Nessuna partita nel campionato selezionato nell’orizzonte scelto.")
+    st.stop()
+
 # ---------- UI principale ----------
-labels = [f"{f['league']} • {f['date']} • {f['home']} - {f['away']}  ({f['source']})" for f in fixtures]
+labels = [f"{f['league']} • {f['date']} • {f['home']} - {f['away']}  ({f['source']})" for f in fixtures_view]
 pick = st.selectbox("Scegli una partita", labels, index=0)
-fx = fixtures[labels.index(pick)]
+fx = fixtures_view[labels.index(pick)]
 code, home_raw, away_raw, date_iso = fx["code"], fx["home"], fx["away"], fx["date"]
 tz = LEAGUE_TZ.get(code, "Europe/Rome")
 
-# Mappa i nomi a quelli delle metriche
+# Mappa nomi → metriche
 home, away = normalize_for_metrics(code, home_raw, away_raw, METRICS)
 
 st.write(f"### {home_raw} vs {away_raw} — {fx['league']} — {date_iso}")
 if (home != home_raw) or (away != away_raw):
     st.caption(f"Allineamento per metriche: {home_raw} → {home} • {away_raw} → {away}")
 
-# Avviso se profilo sintetico
-missing = []
-if code in METRICS and METRICS[code].get('teams'):
-    if home not in METRICS[code]['teams']: missing.append(home)
-    if away not in METRICS[code]['teams']: missing.append(away)
-if missing:
-    st.info("Squadra senza storico nella lega: " + ", ".join(missing) +
-            " → uso medie di campionato (fallback) finché non ci sono dati sufficienti.")
+# Pannello copertura: limitato al campionato selezionato (più utile)
+with st.expander("🧭 Copertura nomi (controllo)"):
+    miss_rows = []
+    for f in fixtures_view:
+        tH, tA = normalize_for_metrics(f["code"], f["home"], f["away"], METRICS)
+        haveH = tH in METRICS.get(f["code"],{}).get("teams",{})
+        haveA = tA in METRICS.get(f["code"],{}).get("teams",{})
+        if not (haveH and haveA):
+            miss_rows.append({"Lega": f["league"], "Data": f["date"], "Home": f["home"], "Away": f["away"],
+                              "NormHome": tH, "NormAway": tA,
+                              "H_ok": haveH, "A_ok": haveA})
+    if miss_rows:
+        st.warning("Alcune squadre usano il fallback (medie di campionato) finché non c’è storico sufficiente.")
+        st.dataframe(pd.DataFrame(miss_rows), use_container_width=True)
+    else:
+        st.success("Tutti i nomi combaciano con le metriche della stagione scorsa per il campionato selezionato.")
 
 # Meteo
 rain=snow=wind=hot=cold=False
@@ -803,6 +856,7 @@ if use_meteo:
         wind = wx.get('wind_strong', False); hot = wx.get('hot', False); cold = wx.get('cold', False)
         st.caption(f"Meteo: T={wx.get('temp_c','?')}°C • P={wx.get('precip_mm','?')}mm • V={wx.get('wind_kmh','?')}km/h")
 
+# Soglie personalizzate
 c1, c2 = st.columns(2)
 with c1:
     th_home = st.number_input(f"Soglia tiri {home} (usa .5, es. 10.5)", min_value=0.0, value=10.5, step=0.5)
@@ -867,10 +921,10 @@ if corners_params and lam_h_c and lam_a_c:
 else:
     st.info("Dati corner incompleti: mostro solo tiri.")
 
-# Lista completa prossimi giorni (veloce)
+# Lista completa prossimi giorni – filtrata per campionato
 st.subheader("📊 Prossimi giorni – soglie standard (veloce)")
 rows = []
-for fx in fixtures:
+for fx in fixtures_view:  # <— usa il filtro campionato
     code0, home0, away0, d = fx["code"], fx["home"], fx["away"], fx["date"]
     h_m, a_m = normalize_for_metrics(code0, home0, away0, METRICS)
     sp = compute_lambda_and_var(METRICS, code0, h_m, a_m, "tiri")
@@ -904,9 +958,9 @@ if rows:
     except Exception:
         pass
     st.dataframe(df_out, use_container_width=True)
-    st.download_button("Scarica CSV unico", df_out.to_csv(index=False).encode('utf-8'),
+    st.download_button("Scarica CSV (campionato selezionato)", df_out.to_csv(index=False).encode('utf-8'),
                        "dashboard_prob_calibrate.csv", "text/csv")
 else:
-    st.info("Nessuna riga da mostrare nella tabella veloce.")
+    st.info("Nessuna riga da mostrare nella tabella veloce per il campionato selezionato.")
 
-st.caption("Calendari: API-FOOTBALL (primaria) • Fallback: football-data.org/FPL • Meteo: Open-Meteo • Metriche: football-data.co.uk (stagione scorsa; fallback medie per neopromosse).")
+st.caption("Calendari: API-FOOTBALL (primaria) • Fallback: football-data.org/FPL • Meteo: Open-Meteo • Metriche: football-data.co.uk (stagione scorsa). Alias italiani + auto-apprendimento per nomi squadre. Filtro per campionato attivo.")
