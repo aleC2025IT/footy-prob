@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-# ===== streamlit_app.py — v8.5 (La Liga aliases + matcher ES, fallback neopromosse) =====
+# ===== streamlit_app.py — v8.6 (FIX away: usa league_mean AWAY; alias La Liga + Bundesliga; fallback neopromosse) =====
 # - Calendari: API-FOOTBALL (primaria) • fallback: football-data.org • FPL per Premier.
 # - Metriche: stagione scorsa football-data.co.uk (+ opzionale stagione corrente 30%).
 # - Meteo: Open-Meteo (gratis).
-# - Matching robusto: alias estesi (Atlético, Barça, Espanyol, Celta, Mallorca, Elche, Levante, Oviedo, Sociedad…),
-#   normalizzazione (rimozione numeri e prefissi, token ES come RC/RCD/CF/UD/“club”/“de”/“futbol”).
-# - Fallback automatico per squadre senza storico (usa medie di lega).
+# - Matching robusto: alias estesi (Liga/BL), normalizzazione (rimozione numeri/prefissi), fuzzy permissivo.
+# - Fallback automatico: se una squadra non ha storico, usa medie di campionato. 
+# - BUGFIX: per la squadra in trasferta si usa la media di lega AWAY (prima era HOME → poteva far crollare p_over).
 
 import os, sys, io, json, re, time, datetime, unicodedata
 from datetime import date, timedelta
@@ -18,7 +18,7 @@ import streamlit as st
 import yaml
 from math import exp, lgamma, log
 
-# ----- repo root (se mai servisse pipeline) -----
+# ----- repo root -----
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -142,8 +142,8 @@ except Exception:
         return float(max(0.0, min(1.0, 1.0 - cdf)))
 
 # ---------- pagina ----------
-st.set_page_config(page_title="v8.5 • Probabilità calibrate + Meteo", layout="wide")
-st.title("v8.5 • Probabilità calibrate + Meteo • Dashboard automatica")
+st.set_page_config(page_title="v8.6 • Probabilità calibrate + Meteo", layout="wide")
+st.title("v8.6 • Probabilità calibrate + Meteo • Dashboard automatica")
 
 # ---------- Paths ----------
 DATA_PATH = Path('app/public/data/league_team_metrics.json')   # (non obbligatori in v8.x)
@@ -177,7 +177,7 @@ def strip_accents(s):
 
 # alias → target: nomi come in football-data.co.uk (metriche stagione scorsa)
 ALIASES_METRICS = {
-    # La Liga (estesi)
+    # La Liga
     ("SP1","Athletic Club"): "Ath Bilbao",
     ("SP1","Athletic Bilbao"): "Ath Bilbao",
     ("SP1","Club Atlético de Madrid"): "Atl Madrid",
@@ -202,7 +202,6 @@ ALIASES_METRICS = {
     ("SP1","RC Celta de Vigo"): "Celta",
     ("SP1","Celta de Vigo"): "Celta",
     ("SP1","Celta Vigo"): "Celta",
-    ("SP1","RC Deportivo de La Coruña"): "La Coruna",
     ("SP1","Real Oviedo"): "Oviedo",
     ("SP1","Oviedo"): "Oviedo",
     ("SP1","Real Betis"): "Betis",
@@ -220,7 +219,7 @@ ALIASES_METRICS = {
     ("I1","SSC Napoli"): "Napoli",
     ("I1","ACF Fiorentina"): "Fiorentina",
 
-    # Bundesliga (estesi, inclusi HSV/Köln/Mainz/Heidenheim)
+    # Bundesliga (estesi)
     ("D1","FC Bayern München"): "Bayern Munich",
     ("D1","Bayern München"): "Bayern Munich",
     ("D1","Bayern Munich"): "Bayern Munich",
@@ -262,17 +261,15 @@ ALIASES_METRICS = {
 def _canon(s):
     s = strip_accents(s).lower()
     # normalizzazioni utili
-    s = s.replace("muenchen","munich").replace("munchen","munich")  # DE
+    s = s.replace("muenchen","munich").replace("munchen","munich")
     s = s.replace("monchengladbach","mgladbach").replace("mönchengladbach","mgladbach")
     s = s.replace("koln","koln").replace("cologne","koln")
-    s = s.replace("hamburger","hamburg")  # HSV
-    # ES: semplificazioni comuni
-    s = s.replace("futbol", "futbol").replace("atletico", "atletico")
+    s = s.replace("hamburger","hamburg")
     # rimuovi numeri (Schalke 04, 1846, 05…)
     s = re.sub(r'\b\d+\b', ' ', s)
     # pulizia caratteri
     s = re.sub(r'[^a-z0-9]+', ' ', s).strip()
-    # rimuovi prefissi/comuni (aggiunti rc/rcd/futbol)
+    # rimuovi prefissi/comuni (ES: rc/rcd/cf/ud/futbol; DE: borussia/eintracht/tsg/vfl/vfb/sc; generici: fc/sv/club/la/de/real)
     s = re.sub(r'\b(cf|fc|ud|cd|sd|sv|rc|rcd|club|de|la|real|futbol|borussia|eintracht|tsg|vfl|vfb|sc)\b', '', s).strip()
     s = re.sub(r'\s+', ' ', s).strip()
     return s
@@ -648,7 +645,7 @@ def _team_profile_or_fallback(METRICS, code, team):
         "vr_corners_against_away": vr.get('corners_away_for', 1.3),
     }, True
 
-# ---------- Modeling helpers ----------
+# ---------- Modeling helpers (BUGFIX AWAY) ----------
 def compute_lambda_and_var(METRICS, code, home, away, metric):
     if code not in METRICS: return None
     lg = METRICS[code]
@@ -659,26 +656,41 @@ def compute_lambda_and_var(METRICS, code, home, away, metric):
     ta, _ = _team_profile_or_fallback(METRICS, code, away)
 
     if metric == "tiri":
-        team_for_home = th.get('shots_for_home'); league_for_home = league_means.get('shots_home_for')
-        opp_against_away = ta.get('shots_against_away'); league_against_away = league_means.get('shots_away_against')
-        league_mean = (league_means.get('shots_home_for',np.nan) + league_means.get('shots_away_for',np.nan))/2.0
-        team_for_away = ta.get('shots_for_away'); opp_against_home = th.get('shots_against_home')
+        # HOME
+        team_for_home       = th.get('shots_for_home')
+        league_for_home     = league_means.get('shots_home_for')      # media lega HOME
+        opp_against_away    = ta.get('shots_against_away')
+        league_against_away = league_means.get('shots_away_against')  # media lega AGAINST lato away
+        # AWAY (FIX: usa media lega AWAY, non HOME!)
+        team_for_away       = ta.get('shots_for_away')
+        league_for_away     = league_means.get('shots_away_for')      # <-- FIX
+        opp_against_home    = th.get('shots_against_home')
         league_against_home = league_means.get('shots_home_against')
-        H_home, H_away = 1.05, 0.95
+        # media complessiva
+        league_mean         = (league_means.get('shots_home_for',np.nan) + league_means.get('shots_away_for',np.nan))/2.0
+        H_home, H_away      = 1.05, 0.95
         vr_home = blended_var_factor(th.get('vr_shots_for_home'), ta.get('vr_shots_against_away'), league_vr.get('shots_home_for', 1.1), 1.0, 2.0)
         vr_away = blended_var_factor(ta.get('vr_shots_for_away'), th.get('vr_shots_against_home'), league_vr.get('shots_away_for', 1.1), 1.0, 2.0)
+
     else:
-        team_for_home = th.get('corners_for_home'); league_for_home = league_means.get('corners_home_for')
-        opp_against_away = ta.get('corners_against_away'); league_against_away = league_means.get('corners_away_against')
-        league_mean = (league_means.get('corners_home_for',np.nan) + league_means.get('corners_away_for',np.nan))/2.0
-        team_for_away = ta.get('corners_for_away'); opp_against_home = th.get('corners_against_home')
+        # HOME
+        team_for_home       = th.get('corners_for_home')
+        league_for_home     = league_means.get('corners_home_for')
+        opp_against_away    = ta.get('corners_against_away')
+        league_against_away = league_means.get('corners_away_against')
+        # AWAY (FIX: usa media lega AWAY, non HOME!)
+        team_for_away       = ta.get('corners_for_away')
+        league_for_away     = league_means.get('corners_away_for')    # <-- FIX
+        opp_against_home    = th.get('corners_against_home')
         league_against_home = league_means.get('corners_home_against')
-        H_home, H_away = 1.03, 0.97
+        # media complessiva
+        league_mean         = (league_means.get('corners_home_for',np.nan) + league_means.get('corners_away_for',np.nan))/2.0
+        H_home, H_away      = 1.03, 0.97
         vr_home = blended_var_factor(th.get('vr_corners_for_home'), ta.get('vr_corners_against_away'), league_vr.get('corners_home_for', 1.3), 1.1, 2.5)
         vr_away = blended_var_factor(ta.get('vr_corners_for_away'), th.get('vr_corners_against_home'), league_vr.get('corners_away_for', 1.3), 1.1, 2.5)
 
     lam_home = combine_strengths(team_for_home, league_for_home, opp_against_away, league_against_away, league_mean, H_home)
-    lam_away = combine_strengths(team_for_away, league_for_home, opp_against_home, league_against_home, H_away)
+    lam_away = combine_strengths(team_for_away, league_for_away, opp_against_home, league_against_home, league_mean, H_away)  # <-- FIX usa league_for_away
     return lam_home, lam_away, vr_home, vr_away
 
 def apply_isotonic(CAL, code, metric, side_key, k_int, p):
