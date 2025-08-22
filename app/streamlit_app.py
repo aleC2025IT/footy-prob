@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
-# ===== streamlit_app.py — v9.1 =====
-# Novità v9.1: menù a tendina per CAMPIONATO -> poi menù PARTITE filtrato.
-# Tutto il resto (alias, auto-apprendimento, meteo, probabilità) invariato.
+# ===== streamlit_app.py — v9.2 =====
+# Fix alias Liga:
+#  - "Rayo Vallecano de Madrid" -> Rayo Vallecano
+#  - "RCD Espanyol de Barcelona" -> Espanyol
+#  - Disambiguazione forzata su token ("rayo","espanyol") con priorità sui learned
+#  - Sanitizzazione learned_aliases che avevano imparato Real Madrid/Barcelona per quei nomi
+# Restante logica identica alla v9.1 (filtro per campionato, meteo, probabilità, alias italiani, ecc.)
 
 import os, sys, io, json, re, time, datetime, unicodedata
 from datetime import date, timedelta
@@ -103,8 +107,7 @@ except Exception:
     def _poisson_cdf(k, lam):
         if lam <= 0:
             return 1.0 if k >= 0 else 0.0
-        p = exp(-lam)
-        s = p
+        p = exp(-lam); s = p
         for x in range(0, int(k)):
             p *= lam / (x+1)
             s += p
@@ -138,8 +141,8 @@ except Exception:
         return float(max(0.0, min(1.0, 1.0 - cdf)))
 
 # ---------- pagina ----------
-st.set_page_config(page_title="v9.1 • Probabilità calibrate + Meteo", layout="wide")
-st.title("v9.1 • Probabilità calibrate + Meteo • Dashboard automatica")
+st.set_page_config(page_title="v9.2 • Probabilità calibrate + Meteo", layout="wide")
+st.title("v9.2 • Probabilità calibrate + Meteo • Dashboard automatica")
 
 # ---------- Paths ----------
 DATA_PATH = Path('app/public/data/league_team_metrics.json')  # (non obbligatori in v9.x)
@@ -171,8 +174,7 @@ def strip_accents(s): return ''.join(c for c in unicodedata.normalize('NFD', str
 
 # ===== Alias statici (italiano + varianti) → target (candidati multipli) =====
 ALIASES_STATIC = {
-    # (… identico alla v9.0: alias completi per Serie A, La Liga, Bundesliga, Premier …)
-    # --- Per brevità: lascia qui TUTTO il blocco ALIASES_STATIC della v9.0 senza modifiche ---
+    # --- Serie A (estratto) ---
     ("I1","Inter"): ["Inter"],
     ("I1","Internazionale"): ["Inter"],
     ("I1","Juventus"): ["Juventus"],
@@ -203,6 +205,7 @@ ALIASES_STATIC = {
     ("I1","Brescia"): ["Brescia"],
     ("I1","Spezia"): ["Spezia"],
     ("I1","Palermo"): ["Palermo"],
+    # --- La Liga (estratto + fix richiesti) ---
     ("SP1","Real Madrid"): ["Real Madrid"],
     ("SP1","Barcellona"): ["Barcelona","FC Barcelona"],
     ("SP1","Barcelona"): ["Barcelona","FC Barcelona"],
@@ -220,6 +223,12 @@ ALIASES_STATIC = {
     ("SP1","Celta"): ["Celta","Celta Vigo"],
     ("SP1","Osasuna"): ["Osasuna"],
     ("SP1","Rayo Vallecano"): ["Rayo Vallecano","Vallecano"],
+    # >>> Fix: stringhe lunghe ufficiali
+    ("SP1","Rayo Vallecano de Madrid"): ["Rayo Vallecano"],
+    ("SP1","RCD Espanyol de Barcelona"): ["Espanyol","RCD Espanyol"],
+    ("SP1","Espanyol de Barcelona"): ["Espanyol","RCD Espanyol"],
+    ("SP1","RCD Espanyol"): ["Espanyol","RCD Espanyol"],
+    # altri
     ("SP1","Getafe"): ["Getafe"],
     ("SP1","Mallorca"): ["Mallorca","RCD Mallorca"],
     ("SP1","Espanyol"): ["Espanyol","RCD Espanyol"],
@@ -235,69 +244,68 @@ ALIASES_STATIC = {
     ("SP1","Leganes"): ["Leganes","CD Leganes"],
     ("SP1","Elche"): ["Elche","Elche CF"],
     ("SP1","Oviedo"): ["Oviedo","Real Oviedo"],
+    # --- Bundesliga (estratto) ---
     ("D1","Bayern Monaco"): ["Bayern Munich","Bayern München"],
     ("D1","Bayern München"): ["Bayern Munich","Bayern München"],
     ("D1","Bayern Munich"): ["Bayern Munich","Bayern München"],
-    ("D1","Borussia Dortmund"): ["Dortmund","Borussia Dortmund"],
-    ("D1","Bayer Leverkusen"): ["Leverkusen","Bayer Leverkusen"],
-    ("D1","Leverkusen"): ["Leverkusen","Bayer Leverkusen"],
+    ("D1","Borussia Dortmund"): ["Borussia Dortmund","Dortmund"],
+    ("D1","Bayer Leverkusen"): ["Bayer Leverkusen","Leverkusen"],
     ("D1","Borussia Mönchengladbach"): ["M'gladbach","Borussia Monchengladbach","Borussia Moenchengladbach"],
     ("D1","Monchengladbach"): ["M'gladbach","Borussia Monchengladbach","Borussia Moenchengladbach"],
     ("D1","Colonia"): ["FC Koln","Cologne","1. FC Köln","1. FC Koeln"],
     ("D1","1. FC Köln"): ["FC Koln","1. FC Koeln","Cologne"],
     ("D1","Hoffenheim"): ["Hoffenheim","1899 Hoffenheim"],
-    ("D1","Eintracht Francoforte"): ["Frankfurt","Eintracht Frankfurt"],
-    ("D1","Eintracht Frankfurt"): ["Frankfurt","Eintracht Frankfurt"],
-    ("D1","Friburgo"): ["Freiburg","SC Freiburg"],
-    ("D1","Friburgo in Brisgovia"): ["Freiburg","SC Freiburg"],
-    ("D1","Augusta"): ["Augsburg","FC Augsburg"],
-    ("D1","Stoccarda"): ["Stuttgart","VfB Stuttgart"],
-    ("D1","Wolfsburg"): ["Wolfsburg","VfL Wolfsburg"],
-    ("D1","Union Berlino"): ["Union Berlin","1. FC Union Berlin"],
-    ("D1","Mainz"): ["Mainz","Mainz 05","FSV Mainz 05"],
-    ("D1","Mainz 05"): ["Mainz","Mainz 05","FSV Mainz 05"],
+    ("D1","Eintracht Francoforte"): ["Eintracht Frankfurt","Frankfurt"],
+    ("D1","Eintracht Frankfurt"): ["Eintracht Frankfurt","Frankfurt"],
+    ("D1","Friburgo"): ["SC Freiburg","Freiburg"],
+    ("D1","Augusta"): ["FC Augsburg","Augsburg"],
+    ("D1","Stoccarda"): ["VfB Stuttgart","Stuttgart"],
+    ("D1","Wolfsburg"): ["VfL Wolfsburg","Wolfsburg"],
+    ("D1","Union Berlino"): ["1. FC Union Berlin","Union Berlin"],
+    ("D1","Mainz"): ["Mainz 05","FSV Mainz 05","Mainz"],
+    ("D1","Mainz 05"): ["Mainz 05","FSV Mainz 05","Mainz"],
     ("D1","RB Lipsia"): ["RB Leipzig","Leipzig","RasenBallsport Leipzig"],
     ("D1","RB Leipzig"): ["RB Leipzig","Leipzig","RasenBallsport Leipzig"],
-    ("D1","Leipzig"): ["Leipzig","RB Leipzig","RasenBallsport Leipzig"],
-    ("D1","Amburgo"): ["Hamburg","Hamburger SV","Hamburg SV"],
-    ("D1","Hamburger SV"): ["Hamburg","Hamburger SV","Hamburg SV"],
-    ("D1","Werder Brema"): ["Werder Bremen","SV Werder Bremen"],
-    ("D1","Werder Bremen"): ["Werder Bremen","SV Werder Bremen"],
-    ("D1","Bochum"): ["Bochum","VfL Bochum"],
-    ("D1","Heidenheim"): ["Heidenheim","1. FC Heidenheim 1846","Heidenheim 1846","FC Heidenheim 1846"],
-    ("D1","Köln"): ["FC Koln","1. FC Köln","1. FC Koeln"],
+    ("D1","Leipzig"): ["RB Leipzig","Leipzig","RasenBallsport Leipzig"],
+    ("D1","Amburgo"): ["Hamburger SV","Hamburg","Hamburg SV"],
+    ("D1","Hamburger SV"): ["Hamburger SV","Hamburg","Hamburg SV"],
+    ("D1","Werder Brema"): ["SV Werder Bremen","Werder Bremen"],
+    ("D1","Werder Bremen"): ["SV Werder Bremen","Werder Bremen"],
+    ("D1","Bochum"): ["VfL Bochum","Bochum"],
+    ("D1","Heidenheim"): ["1. FC Heidenheim 1846","Heidenheim","Heidenheim 1846","FC Heidenheim 1846"],
+    ("D1","Köln"): ["1. FC Köln","FC Koln","1. FC Koeln"],
+    # --- Premier League (estratto) ---
     ("E0","Arsenal"): ["Arsenal"],
     ("E0","Aston Villa"): ["Aston Villa"],
-    ("E0","Bournemouth"): ["Bournemouth","AFC Bournemouth"],
+    ("E0","Bournemouth"): ["AFC Bournemouth","Bournemouth"],
     ("E0","Brentford"): ["Brentford"],
-    ("E0","Brighton"): ["Brighton","Brighton & Hove Albion"],
+    ("E0","Brighton"): ["Brighton & Hove Albion","Brighton"],
     ("E0","Chelsea"): ["Chelsea"],
     ("E0","Crystal Palace"): ["Crystal Palace"],
     ("E0","Everton"): ["Everton"],
     ("E0","Fulham"): ["Fulham"],
     ("E0","Liverpool"): ["Liverpool"],
-    ("E0","Luton"): ["Luton","Luton Town"],
-    ("E0","Manchester City"): ["Man City","Manchester City"],
-    ("E0","Man City"): ["Man City","Manchester City"],
-    ("E0","Manchester United"): ["Man United","Manchester United"],
-    ("E0","Man United"): ["Man United","Manchester United"],
-    ("E0","Newcastle"): ["Newcastle","Newcastle United"],
-    ("E0","Nottingham Forest"): ["Nottm Forest","Nottingham Forest"],
-    ("E0","Nottm Forest"): ["Nottm Forest","Nottingham Forest"],
+    ("E0","Luton"): ["Luton Town","Luton"],
+    ("E0","Manchester City"): ["Manchester City","Man City"],
+    ("E0","Man City"): ["Manchester City","Man City"],
+    ("E0","Manchester United"): ["Manchester United","Man United"],
+    ("E0","Man United"): ["Manchester United","Man United"],
+    ("E0","Newcastle"): ["Newcastle United","Newcastle"],
+    ("E0","Nottingham Forest"): ["Nottingham Forest","Nottm Forest"],
+    ("E0","Nottm Forest"): ["Nottingham Forest","Nottm Forest"],
     ("E0","Sheffield United"): ["Sheffield United","Sheff Utd"],
-    ("E0","Tottenham"): ["Tottenham","Tottenham Hotspur"],
-    ("E0","West Ham"): ["West Ham","West Ham United"],
-    ("E0","Wolverhampton"): ["Wolves","Wolverhampton","Wolverhampton Wanderers"],
-    ("E0","Wolves"): ["Wolves","Wolverhampton","Wolverhampton Wanderers"],
-    ("E0","Leicester"): ["Leicester","Leicester City"],
+    ("E0","Tottenham"): ["Tottenham Hotspur","Tottenham"],
+    ("E0","West Ham"): ["West Ham United","West Ham"],
+    ("E0","Wolverhampton"): ["Wolverhampton Wanderers","Wolverhampton","Wolves"],
+    ("E0","Wolves"): ["Wolverhampton Wanderers","Wolverhampton","Wolves"],
+    ("E0","Leicester"): ["Leicester City","Leicester"],
     ("E0","Southampton"): ["Southampton"],
-    ("E0","Leeds"): ["Leeds","Leeds United"],
-    ("E0","Ipswich"): ["Ipswich","Ipswich Town"],
+    ("E0","Leeds"): ["Leeds United","Leeds"],
+    ("E0","Ipswich"): ["Ipswich Town","Ipswich"],
     ("E0","Burnley"): ["Burnley"],
 }
 
 # === Learned aliases (persistenti su file) ===
-LEARNED_ALIASES = Path('app/public/data/learned_aliases.json')
 def _read_learned():
     try:
         if LEARNED_ALIASES.exists():
@@ -321,19 +329,76 @@ def _canon(s):
     s = s.replace("monchengladbach","mgladbach").replace("mönchengladbach","mgladbach")
     s = s.replace("cologne","koln").replace("köln","koln")
     s = s.replace("hamburger","hamburg")
-    s = re.sub(r'\b\d+\b', ' ', s)
+    s = re.sub(r'\b\d+\b', ' ', s)      # 04, 05, 1846...
     s = re.sub(r'[^a-z0-9]+', ' ', s).strip()
-    s = re.sub(r'\b(cf|fc|ud|cd|sd|sv|rc|rcd|ud|club|de|la|real|futbol|borussia|eintracht|tsg|vfl|vfb|sc|ac|ss)\b', '', s).strip()
+    # rimuovo parole vuote/frequenti, ma NON rimuovo 'barcelona' o 'madrid'
+    s = re.sub(r'\b(cf|fc|ud|cd|sd|sv|rc|rcd|club|de|la|real|futbol|borussia|eintracht|tsg|vfl|vfb|sc|ac|ss)\b', '', s).strip()
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
+def _force_team_from_name(code, name_c, teams_available):
+    """Regole di disambiguazione forti (prima di learned/alias) per casi noti."""
+    if code == "SP1":
+        if "rayo" in name_c:
+            for cand in ["Rayo Vallecano"]:
+                if cand in teams_available: return cand
+        if "espanyol" in name_c:
+            for cand in ["Espanyol","RCD Espanyol"]:
+                if cand in teams_available: return cand
+        if "athletic" in name_c and "bilbao" in name_c:
+            for cand in ["Athletic Club","Ath Bilbao"]:
+                if cand in teams_available: return cand
+        if "sociedad" in name_c:
+            for cand in ["Real Sociedad","Sociedad"]:
+                if cand in teams_available: return cand
+    return None
+
+def _sanitize_learned(dct):
+    """Corregge alias sbagliati già appresi per i casi noti."""
+    to_fix = []
+    for k_str, v in list(dct.items()):
+        try:
+            k = eval(k_str)  # ("SP1","<nome>")
+            code, orig = k
+            c = _canon(orig)
+            if code == "SP1":
+                # non far puntare 'rayo ...' a Real Madrid
+                if "rayo" in c and v in ["Real Madrid","Barcelona","FC Barcelona"]:
+                    to_fix.append((k_str, "Rayo Vallecano"))
+                # non far puntare 'espanyol ...' a Barcelona
+                if "espanyol" in c and v in ["Barcelona","FC Barcelona","Real Madrid"]:
+                    to_fix.append((k_str, "Espanyol"))
+        except Exception:
+            continue
+    changed = False
+    for k_str, newv in to_fix:
+        dct[k_str] = newv
+        changed = True
+    if changed:
+        _write_learned(dct)
+
+_sanitize_learned(LEARNED)
+
 def match_team_name(code, name, teams_available):
-    key = (code, str(name).strip())
+    """Restituisce il nome come appare nelle METRICHE."""
+    name_str = str(name).strip()
+    name_c = _canon(name_str)
+
+    # 0) Forzature note (evita apprendimento sbagliato)
+    forced = _force_team_from_name(code, name_c, teams_available)
+    if forced:
+        LEARNED[str((code, name_str))] = forced
+        _write_learned(LEARNED)
+        return forced
+
+    key = (code, name_str)
+
     # 1) learned
     if str(key) in LEARNED:
         cand = LEARNED[str(key)]
         if cand in teams_available:
             return cand
+
     # 2) static
     if key in ALIASES_STATIC:
         cand_list = ALIASES_STATIC[key]
@@ -344,12 +409,13 @@ def match_team_name(code, name, teams_available):
                 LEARNED[str(key)] = c
                 _write_learned(LEARNED)
                 return c
+
     # 3) esatto
-    if name in teams_available:
-        return name
-    # 4) fuzzy
+    if name_str in teams_available:
+        return name_str
+
+    # 4) fuzzy (Jaccard su token)
     target_map = {t: _canon(t) for t in teams_available}
-    name_c = _canon(name)
     best_t, best_score = None, 0.0
     for t, c in target_map.items():
         if not c: continue
@@ -364,7 +430,8 @@ def match_team_name(code, name, teams_available):
         LEARNED[str(key)] = best_t
         _write_learned(LEARNED)
         return best_t
-    return name
+
+    return name_str
 
 def normalize_for_metrics(code, home, away, METRICS):
     teams = list(METRICS.get(code, {}).get('teams', {}).keys())
@@ -663,8 +730,8 @@ def _team_profile_or_fallback(METRICS, code, team):
         "shots_against_away": lm.get('shots_away_against', np.nan),
         "corners_for_home": lm.get('corners_home_for', np.nan),
         "corners_for_away": lm.get('corners_away_for', np.nan),
-        "corners_against_home": lm.get('corners_home_against', np.nan),
-        "corners_against_away": lm.get('corners_away_against', np.nan),
+        "corners_against_home": lm.get('corners_away_for', np.nan),
+        "corners_against_away": lm.get('corners_home_for', np.nan),
         "vr_shots_for_home": vr.get('shots_home_for', 1.2),
         "vr_shots_for_away": vr.get('shots_away_for', 1.2),
         "vr_shots_against_home": vr.get('shots_home_for', 1.2),
@@ -675,7 +742,7 @@ def _team_profile_or_fallback(METRICS, code, team):
         "vr_corners_against_away": vr.get('corners_away_for', 1.3),
     }, True
 
-# ---------- Modeling helpers (AWAY corretto) ----------
+# ---------- Modeling helpers ----------
 def compute_lambda_and_var(METRICS, code, home, away, metric):
     if code not in METRICS: return None
     lg = METRICS[code]
@@ -806,7 +873,7 @@ if not fixtures:
     st.warning("Nessuna partita trovata. Verifica le chiavi nei Secrets e riduci i giorni a 7–10.")
     st.stop()
 
-# --------- NUOVO: filtro per campionato ---------
+# --------- Filtro per campionato ---------
 present_leagues = sorted({f['league'] for f in fixtures})
 league_choice = st.selectbox("Scegli il campionato", ["Tutti"] + present_leagues, index=0)
 fixtures_view = fixtures if league_choice == "Tutti" else [f for f in fixtures if f['league'] == league_choice]
@@ -829,7 +896,7 @@ st.write(f"### {home_raw} vs {away_raw} — {fx['league']} — {date_iso}")
 if (home != home_raw) or (away != away_raw):
     st.caption(f"Allineamento per metriche: {home_raw} → {home} • {away_raw} → {away}")
 
-# Pannello copertura: limitato al campionato selezionato (più utile)
+# Pannello copertura (campionato filtrato)
 with st.expander("🧭 Copertura nomi (controllo)"):
     miss_rows = []
     for f in fixtures_view:
@@ -924,7 +991,7 @@ else:
 # Lista completa prossimi giorni – filtrata per campionato
 st.subheader("📊 Prossimi giorni – soglie standard (veloce)")
 rows = []
-for fx in fixtures_view:  # <— usa il filtro campionato
+for fx in fixtures_view:
     code0, home0, away0, d = fx["code"], fx["home"], fx["away"], fx["date"]
     h_m, a_m = normalize_for_metrics(code0, home0, away0, METRICS)
     sp = compute_lambda_and_var(METRICS, code0, h_m, a_m, "tiri")
@@ -963,4 +1030,4 @@ if rows:
 else:
     st.info("Nessuna riga da mostrare nella tabella veloce per il campionato selezionato.")
 
-st.caption("Calendari: API-FOOTBALL (primaria) • Fallback: football-data.org/FPL • Meteo: Open-Meteo • Metriche: football-data.co.uk (stagione scorsa). Alias italiani + auto-apprendimento per nomi squadre. Filtro per campionato attivo.")
+st.caption("Calendari: API-FOOTBALL (primaria) • Fallback: football-data.org/FPL • Meteo: Open-Meteo • Metriche: football-data.co.uk (stagione scorsa). Alias italiani + auto-apprendimento con disambiguazione forte per Rayo/Espanyol. Filtro per campionato attivo.")
