@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-# ===== streamlit_app.py — v8.1 (API-FOOTBALL primaria, FD fallback, zero scraping) =====
-# - Calendari: API-FOOTBALL → stabile; fallback football-data.org; FPL per PL.
-# - Metriche: stagione scorsa da football-data.co.uk (+ opzionale corrente al 30%).
+# ===== streamlit_app.py — v8.5 (La Liga aliases + matcher ES, fallback neopromosse) =====
+# - Calendari: API-FOOTBALL (primaria) • fallback: football-data.org • FPL per Premier.
+# - Metriche: stagione scorsa football-data.co.uk (+ opzionale stagione corrente 30%).
 # - Meteo: Open-Meteo (gratis).
-# - Matching nomi robusto: alias estesi + fuzzy con normalizzazioni (Bundesliga inclusa).
-# - Poisson/NBinom implementati senza SciPy.
+# - Matching robusto: alias estesi (Atlético, Barça, Espanyol, Celta, Mallorca, Elche, Levante, Oviedo, Sociedad…),
+#   normalizzazione (rimozione numeri e prefissi, token ES come RC/RCD/CF/UD/“club”/“de”/“futbol”).
+# - Fallback automatico per squadre senza storico (usa medie di lega).
 
 import os, sys, io, json, re, time, datetime, unicodedata
 from datetime import date, timedelta
@@ -141,8 +142,8 @@ except Exception:
         return float(max(0.0, min(1.0, 1.0 - cdf)))
 
 # ---------- pagina ----------
-st.set_page_config(page_title="v8.1 • Probabilità calibrate + Meteo", layout="wide")
-st.title("v8.1 • Probabilità calibrate + Meteo • Dashboard automatica")
+st.set_page_config(page_title="v8.5 • Probabilità calibrate + Meteo", layout="wide")
+st.title("v8.5 • Probabilità calibrate + Meteo • Dashboard automatica")
 
 # ---------- Paths ----------
 DATA_PATH = Path('app/public/data/league_team_metrics.json')   # (non obbligatori in v8.x)
@@ -174,23 +175,39 @@ def _safe_df(): return pd.DataFrame(columns=["date","home","away"])
 def strip_accents(s):
     return ''.join(c for c in unicodedata.normalize('NFD', str(s)) if unicodedata.category(c) != 'Mn')
 
-# alias → target: NOMI COME IN football-data.co.uk (metriche stagione scorsa)
+# alias → target: nomi come in football-data.co.uk (metriche stagione scorsa)
 ALIASES_METRICS = {
-    # La Liga
+    # La Liga (estesi)
     ("SP1","Athletic Club"): "Ath Bilbao",
     ("SP1","Athletic Bilbao"): "Ath Bilbao",
+    ("SP1","Club Atlético de Madrid"): "Atl Madrid",
     ("SP1","Atletico Madrid"): "Atl Madrid",
     ("SP1","Atlético Madrid"): "Atl Madrid",
-    ("SP1","Real Betis"): "Betis",
+    ("SP1","FC Barcelona"): "Barcelona",
+    ("SP1","Futbol Club Barcelona"): "Barcelona",
+    ("SP1","Barcelona"): "Barcelona",
+    ("SP1","Real Madrid CF"): "Real Madrid",
+    ("SP1","Real Madrid"): "Real Madrid",
+    ("SP1","Real Sociedad de Fútbol"): "Sociedad",
+    ("SP1","Real Sociedad de Futbol"): "Sociedad",
     ("SP1","Real Sociedad"): "Sociedad",
-    ("SP1","Deportivo Alaves"): "Alaves",
-    ("SP1","Alavés"): "Alaves",
+    ("SP1","RCD Espanyol de Barcelona"): "Espanyol",
+    ("SP1","Espanyol"): "Espanyol",
+    ("SP1","Elche CF"): "Elche",
+    ("SP1","Elche"): "Elche",
+    ("SP1","Levante UD"): "Levante",
+    ("SP1","Levante"): "Levante",
+    ("SP1","RCD Mallorca"): "Mallorca",
+    ("SP1","Mallorca"): "Mallorca",
+    ("SP1","RC Celta de Vigo"): "Celta",
+    ("SP1","Celta de Vigo"): "Celta",
     ("SP1","Celta Vigo"): "Celta",
-    ("SP1","Cádiz"): "Cadiz",
-    ("SP1","Cadiz"): "Cadiz",
-    ("SP1","Sevilla FC"): "Sevilla",
-    ("SP1","Rayo Vallecano"): "Vallecano",
-    ("SP1","UD Las Palmas"): "Las Palmas",
+    ("SP1","RC Deportivo de La Coruña"): "La Coruna",
+    ("SP1","Real Oviedo"): "Oviedo",
+    ("SP1","Oviedo"): "Oviedo",
+    ("SP1","Real Betis"): "Betis",
+    ("SP1","Real Sociedad San Sebastian"): "Sociedad",
+
     # Serie A
     ("I1","Internazionale"): "Inter",
     ("I1","SS Lazio"): "Lazio",
@@ -202,7 +219,8 @@ ALIASES_METRICS = {
     ("I1","US Salernitana"): "Salernitana",
     ("I1","SSC Napoli"): "Napoli",
     ("I1","ACF Fiorentina"): "Fiorentina",
-    # Bundesliga (esteso)
+
+    # Bundesliga (estesi, inclusi HSV/Köln/Mainz/Heidenheim)
     ("D1","FC Bayern München"): "Bayern Munich",
     ("D1","Bayern München"): "Bayern Munich",
     ("D1","Bayern Munich"): "Bayern Munich",
@@ -211,44 +229,63 @@ ALIASES_METRICS = {
     ("D1","Bayer Leverkusen"): "Leverkusen",
     ("D1","Borussia Mönchengladbach"): "M'gladbach",
     ("D1","Borussia Moenchengladbach"): "M'gladbach",
+    ("D1","Borussia Monchengladbach"): "M'gladbach",
     ("D1","1. FC Köln"): "FC Koln",
     ("D1","1. FC Koeln"): "FC Koln",
+    ("D1","1 FC Koln"): "FC Koln",
+    ("D1","FC Koln"): "FC Koln",
     ("D1","VfB Stuttgart"): "Stuttgart",
     ("D1","VfL Wolfsburg"): "Wolfsburg",
+    ("D1","Wolfsburg"): "Wolfsburg",
     ("D1","TSG Hoffenheim"): "Hoffenheim",
+    ("D1","1899 Hoffenheim"): "Hoffenheim",
     ("D1","Eintracht Frankfurt"): "Frankfurt",
     ("D1","SC Freiburg"): "Freiburg",
     ("D1","FC Augsburg"): "Augsburg",
     ("D1","RB Leipzig"): "RB Leipzig",
     ("D1","1. FC Union Berlin"): "Union Berlin",
     ("D1","FSV Mainz 05"): "Mainz",
+    ("D1","Mainz 05"): "Mainz",
     ("D1","1. FC Heidenheim"): "Heidenheim",
-    ("D1","SV Darmstadt 98"): "Darmstadt",
+    ("D1","1. FC Heidenheim 1846"): "Heidenheim",
+    ("D1","Heidenheim 1846"): "Heidenheim",
+    ("D1","FC Heidenheim 1846"): "Heidenheim",
+    ("D1","1 FC Heidenheim 1846"): "Heidenheim",
     ("D1","VfL Bochum"): "Bochum",
+    ("D1","SV Werder Bremen"): "Werder Bremen",
+    ("D1","Werder Bremen"): "Werder Bremen",
+    ("D1","Hamburger SV"): "Hamburg",
+    ("D1","Hamburg SV"): "Hamburg",
+    ("D1","Hamburg"): "Hamburg",
 }
 
 def _canon(s):
     s = strip_accents(s).lower()
-    # normalizzazioni utili DE
-    s = s.replace("muenchen","munich").replace("munchen","munich")
+    # normalizzazioni utili
+    s = s.replace("muenchen","munich").replace("munchen","munich")  # DE
     s = s.replace("monchengladbach","mgladbach").replace("mönchengladbach","mgladbach")
-    s = s.replace("koln","koln").replace("cologne","koln")  # fd usa "FC Koln"
-    # pulizia
+    s = s.replace("koln","koln").replace("cologne","koln")
+    s = s.replace("hamburger","hamburg")  # HSV
+    # ES: semplificazioni comuni
+    s = s.replace("futbol", "futbol").replace("atletico", "atletico")
+    # rimuovi numeri (Schalke 04, 1846, 05…)
+    s = re.sub(r'\b\d+\b', ' ', s)
+    # pulizia caratteri
     s = re.sub(r'[^a-z0-9]+', ' ', s).strip()
-    # rimuovi prefissi/comuni
-    s = re.sub(r'\b(cf|fc|ud|cd|sd|club|de|la|real|borussia|eintracht|tsg|vfl|vfb|sc)\b', '', s).strip()
+    # rimuovi prefissi/comuni (aggiunti rc/rcd/futbol)
+    s = re.sub(r'\b(cf|fc|ud|cd|sd|sv|rc|rcd|club|de|la|real|futbol|borussia|eintracht|tsg|vfl|vfb|sc)\b', '', s).strip()
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
 def match_team_name(code, name, teams_available):
-    # alias espliciti
+    # 1) alias espliciti
     key = (code, str(name).strip())
     if key in ALIASES_METRICS:
         return ALIASES_METRICS[key]
-    # esatto
+    # 2) match esatto
     if name in teams_available:
         return name
-    # fuzzy
+    # 3) fuzzy semplice (token Jaccard)
     target_map = {t: _canon(t) for t in teams_available}
     name_c = _canon(name)
     best_t, best_score = None, 0.0
@@ -261,7 +298,7 @@ def match_team_name(code, name, teams_available):
         score = inter / max(1, uni)
         if score > best_score:
             best_t, best_score = t, score
-    if best_t and best_score >= 0.34:   # soglia più permissiva (München/Munich, ecc.)
+    if best_t and best_score >= 0.34:
         return best_t
     return name  # fallback
 
@@ -274,8 +311,7 @@ def normalize_for_metrics(code, home, away, METRICS):
     return h, a
 
 # ---------- Cache fixtures su disco ----------
-FIX_CACHE.parent.mkdir(parents=True, exist_ok=True)
-def _read_fix_cache():
+def _safe_cache_read():
     try:
         if FIX_CACHE.exists():
             return json.loads(FIX_CACHE.read_text(encoding="utf-8"))
@@ -283,9 +319,9 @@ def _read_fix_cache():
         pass
     return {}
 
-def _write_fix_cache(code, df, source):
+def _cache_write(code, df, source):
     try:
-        cache = _read_fix_cache()
+        cache = _safe_cache_read()
         rows = [{"date": str(r["date"]), "home": str(r["home"]), "away": str(r["away"]), "source": source}
                 for _, r in df.iterrows()]
         cache[code] = {"updated_at": int(time.time()), "rows": rows}
@@ -293,8 +329,8 @@ def _write_fix_cache(code, df, source):
     except Exception:
         pass
 
-def _load_from_fix_cache(code, days):
-    cache = _read_fix_cache()
+def _cache_load(code, days):
+    cache = _safe_cache_read()
     if code not in cache: return _safe_df(), "cache: vuota"
     rows = cache[code].get("rows", [])
     if not rows: return _safe_df(), "cache: vuota"
@@ -329,7 +365,7 @@ def _fpl_fixtures_premier(days):
             h = id2name.get(f.get('team_h')); a = id2name.get(f.get('team_a'))
             if h and a: rows.append({"date": str(d), "home": h.strip(), "away": a.strip()})
         df = pd.DataFrame(rows).drop_duplicates().reset_index(drop=True) if rows else _safe_df()
-        if not df.empty: _write_fix_cache("E0", df, "FPL")
+        if not df.empty: _cache_write("E0", df, "FPL")
         return df, ""
     except Exception as e:
         return _safe_df(), f"FPL err: {type(e).__name__}"
@@ -337,27 +373,25 @@ def _fpl_fixtures_premier(days):
 # ---------- football-data.org (fallback API) ----------
 COMP_MAP = {"E0":"PL","I1":"SA","SP1":"PD","D1":"BL1"}
 
-def _fd_call_matches(days, api_key, shrink=False):
+def _fd_call(days, api_key, shrink=False):
     today = date.today()
     horizon = today + timedelta(days=(5 if shrink else max(1, int(days))))
-    comps = ",".join(COMP_MAP.values())
     params = {
         "dateFrom": str(today),
         "dateTo": str(horizon),
-        "competitions": comps,
+        "competitions": ",".join(COMP_MAP.values()),
         "status": "SCHEDULED,POSTPONED"
     }
     headers = {"X-Auth-Token": api_key}
-    r = requests.get("https://api.football-data.org/v4/matches", params=params, headers=headers, timeout=30)
-    return r
+    return requests.get("https://api.football-data.org/v4/matches", params=params, headers=headers, timeout=30)
 
 def _fd_fixtures_all(days, api_key):
     if not api_key:
         return [], pd.DataFrame([{"Lega":"Tutte","Fonte":"—","Partite":0,"Errore":"Manca API key football-data"}])
-    r = _fd_call_matches(days, api_key, shrink=False)
+    r = _fd_call(days, api_key, shrink=False)
     if r.status_code == 429:
         time.sleep(1.2)
-        r = _fd_call_matches(days, api_key, shrink=True)
+        r = _fd_call(days, api_key, shrink=True)
     if r.status_code != 200:
         rows, diags = [], []
         for code, comp in COMP_MAP.items():
@@ -368,8 +402,7 @@ def _fd_fixtures_all(days, api_key):
                 rr = requests.get("https://api.football-data.org/v4/matches",
                                   params=params, headers={"X-Auth-Token": api_key}, timeout=30)
                 if rr.status_code == 200:
-                    js = rr.json()
-                    cnt=0
+                    js = rr.json(); cnt=0
                     for m in js.get("matches", []):
                         d = datetime.datetime.fromisoformat(m["utcDate"].replace("Z","+00:00")).date()
                         h = m["homeTeam"]["name"]; a = m["awayTeam"]["name"]
@@ -403,8 +436,7 @@ def _fd_fixtures_all(days, api_key):
             elif "serie a" in name: comp_code = "I1"
             elif "liga" in name: comp_code = "SP1"
             elif "bundes" in name: comp_code = "D1"
-        if not comp_code: 
-            continue
+        if not comp_code: continue
         d = datetime.datetime.fromisoformat(m["utcDate"].replace("Z","+00:00")).date()
         h = m["homeTeam"]["name"]; a = m["awayTeam"]["name"]
         rows.append({"code": comp_code,
@@ -589,15 +621,43 @@ def _metrics_build(only_last=True, include_cur_weight=0.3):
             }
     return full
 
+# ---------- Fallback profilo squadra ----------
+def _team_profile_or_fallback(METRICS, code, team):
+    lg = METRICS.get(code, {})
+    teams = lg.get('teams', {})
+    if team in teams:
+        return teams[team], False
+    lm = lg.get('league_means', {})
+    vr = lg.get('league_var_ratio', {})
+    return {
+        "shots_for_home": lm.get('shots_home_for', np.nan),
+        "shots_for_away": lm.get('shots_away_for', np.nan),
+        "shots_against_home": lm.get('shots_home_against', np.nan),
+        "shots_against_away": lm.get('shots_away_against', np.nan),
+        "corners_for_home": lm.get('corners_home_for', np.nan),
+        "corners_for_away": lm.get('corners_away_for', np.nan),
+        "corners_against_home": lm.get('corners_home_against', np.nan),
+        "corners_against_away": lm.get('corners_away_against', np.nan),
+        "vr_shots_for_home": vr.get('shots_home_for', 1.2),
+        "vr_shots_for_away": vr.get('shots_away_for', 1.2),
+        "vr_shots_against_home": vr.get('shots_home_for', 1.2),
+        "vr_shots_against_away": vr.get('shots_away_for', 1.2),
+        "vr_corners_for_home": vr.get('corners_home_for', 1.3),
+        "vr_corners_for_away": vr.get('corners_away_for', 1.3),
+        "vr_corners_against_home": vr.get('corners_home_for', 1.3),
+        "vr_corners_against_away": vr.get('corners_away_for', 1.3),
+    }, True
+
 # ---------- Modeling helpers ----------
 def compute_lambda_and_var(METRICS, code, home, away, metric):
     if code not in METRICS: return None
-    teams = METRICS[code].get('teams', {})
-    if home not in teams or away not in teams: return None
     lg = METRICS[code]
     league_means = lg.get('league_means', {})
     league_vr = lg.get('league_var_ratio', {})
-    th, ta = teams[home], teams[away]
+
+    th, _ = _team_profile_or_fallback(METRICS, code, home)
+    ta, _ = _team_profile_or_fallback(METRICS, code, away)
+
     if metric == "tiri":
         team_for_home = th.get('shots_for_home'); league_for_home = league_means.get('shots_home_for')
         opp_against_away = ta.get('shots_against_away'); league_against_away = league_means.get('shots_away_against')
@@ -616,8 +676,9 @@ def compute_lambda_and_var(METRICS, code, home, away, metric):
         H_home, H_away = 1.03, 0.97
         vr_home = blended_var_factor(th.get('vr_corners_for_home'), ta.get('vr_corners_against_away'), league_vr.get('corners_home_for', 1.3), 1.1, 2.5)
         vr_away = blended_var_factor(ta.get('vr_corners_for_away'), th.get('vr_corners_against_home'), league_vr.get('corners_away_for', 1.3), 1.1, 2.5)
+
     lam_home = combine_strengths(team_for_home, league_for_home, opp_against_away, league_against_away, league_mean, H_home)
-    lam_away = combine_strengths(team_for_away, league_for_home, opp_against_home, league_against_home, league_mean, H_away)
+    lam_away = combine_strengths(team_for_away, league_for_home, opp_against_home, league_against_home, H_away)
     return lam_home, lam_away, vr_home, vr_away
 
 def apply_isotonic(CAL, code, metric, side_key, k_int, p):
@@ -720,10 +781,19 @@ st.write(f"### {home_raw} vs {away_raw} — {fx['league']} — {date_iso}")
 if (home != home_raw) or (away != away_raw):
     st.caption(f"Allineamento per metriche: {home_raw} → {home} • {away_raw} → {away}")
 
+# Avviso se profilo sintetico
+missing = []
+if code in METRICS and METRICS[code].get('teams'):
+    if home not in METRICS[code]['teams']: missing.append(home)
+    if away not in METRICS[code]['teams']: missing.append(away)
+if missing:
+    st.info("Squadra senza storico nella lega: " + ", ".join(missing) +
+            " → uso medie di campionato (fallback) finché non ci sono dati sufficienti.")
+
 # Meteo
 rain=snow=wind=hot=cold=False
 if use_meteo:
-    latlon = geocode_team_fallback(home_raw, code, autosave=True)  # uso il nome “umano” per geocoding
+    latlon = geocode_team_fallback(home_raw, code, autosave=True)
     if latlon and latlon.get("lat") and latlon.get("lon"):
         wx = fetch_openmeteo_conditions(latlon["lat"], latlon["lon"], date_iso, hour_local=kick_hour, tz=tz) or {}
         rain = wx.get('rain', False); snow = wx.get('snow', False)
@@ -743,7 +813,7 @@ shots_params   = compute_lambda_and_var(METRICS, code, home, away, "tiri")
 corners_params = compute_lambda_and_var(METRICS, code, home, away, "angoli")
 
 if not shots_params:
-    st.error("Dati squadra non trovati nelle metriche per questa partita (dopo il matching nomi).")
+    st.error("Dati squadra non disponibili per questa partita.")
     st.stop()
 
 lam_h_s, lam_a_s, vr_h_s, vr_a_s = shots_params
@@ -751,6 +821,7 @@ lam_h_c=lam_a_c=vr_h_c=vr_a_c=None
 if corners_params:
     lam_h_c, lam_a_c, vr_h_c, vr_a_c = corners_params
 
+# Meteo
 if use_meteo:
     lam_h_s = adjust_for_weather(lam_h_s, 'tiri', (rain, snow, wind, hot, cold))
     lam_a_s = adjust_for_weather(lam_a_s, 'tiri', (rain, snow, wind, hot, cold))
@@ -835,4 +906,4 @@ if rows:
 else:
     st.info("Nessuna riga da mostrare nella tabella veloce.")
 
-st.caption("Calendari: API-FOOTBALL (primaria) • Fallback: football-data.org/FPL • Meteo: Open-Meteo • Metriche: football-data.co.uk (stagione scorsa).")
+st.caption("Calendari: API-FOOTBALL (primaria) • Fallback: football-data.org/FPL • Meteo: Open-Meteo • Metriche: football-data.co.uk (stagione scorsa; fallback medie per neopromosse).")
